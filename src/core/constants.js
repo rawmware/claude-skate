@@ -18,6 +18,7 @@ export const BOARD = {
   deckThickness: 0.012,
   deckTopY: 0.115, // height of the grip tape above the ground when riding flat
   deckBottomY: 0.103,
+  modelDeckBottomY: 0.076, // underside of the user's modeled deck (src/board/deck.glb): slides sit on this
   kickAngle: 0.33, // nose/tail kick (radians, ~19 deg)
   kickStartZ: 0.28, // |z| where the nose/tail kick begins
   // rider foot targets, board local (x is set to 0, feet sit on the centerline)

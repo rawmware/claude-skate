@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { T } from '../core/tuning.js';
 import { GRAVITY, BOARD, SURFACE_PROPS, RAIL_KINDS } from '../core/constants.js';
 import { FlickRecognizer, trickName } from './flick.js';
 
@@ -37,16 +38,28 @@ const GRINDS = {
   'Feeble Grind': { slide: false, z: -AX, h: TRUCK_H, pitch: 0.2, yaw: -0.22, roll: -0.28, fr: 1.3 },
   'Crooked Grind': { slide: false, z: AX, h: TRUCK_H, pitch: 0.16, yaw: -0.3, roll: -0.18, fr: 1.4 },
   Overcrook: { slide: false, z: AX, h: TRUCK_H, pitch: 0.16, yaw: 0.3, roll: 0.18, fr: 1.4 },
-  Boardslide: { slide: true, z: 0, h: BOARD.deckBottomY, pitch: 0, fr: 1.5 },
-  Lipslide: { slide: true, z: 0, h: BOARD.deckBottomY, pitch: 0, fr: 1.5 },
-  Noseslide: { slide: true, z: 0.33, h: BOARD.deckBottomY + 0.008, pitch: 0.1, fr: 1.6 },
-  Tailslide: { slide: true, z: -0.33, h: BOARD.deckBottomY + 0.008, pitch: -0.1, fr: 1.6 },
-  Bluntslide: { slide: true, z: -0.37, h: BOARD.deckBottomY + 0.02, pitch: -0.95, fr: 1.85 },
-  Noseblunt: { slide: true, z: 0.37, h: BOARD.deckBottomY + 0.02, pitch: 0.95, fr: 1.85 },
+  Salad: { slide: false, z: -AX, h: TRUCK_H, pitch: -0.18, yaw: 0.3, roll: 0.2, fr: 1.4 },
+  Willy: { slide: false, z: -AX, h: TRUCK_H, pitch: -0.18, yaw: -0.3, roll: -0.2, fr: 1.4 },
+  Boardslide: { slide: true, z: 0, h: BOARD.modelDeckBottomY, pitch: 0, fr: 1.5 },
+  Lipslide: { slide: true, z: 0, h: BOARD.modelDeckBottomY, pitch: 0, fr: 1.5 },
+  Noseslide: { slide: true, z: 0.33, h: BOARD.modelDeckBottomY + 0.008, pitch: 0.1, fr: 1.6 },
+  Tailslide: { slide: true, z: -0.33, h: BOARD.modelDeckBottomY + 0.008, pitch: -0.1, fr: 1.6 },
+  Bluntslide: { slide: true, z: -0.37, h: BOARD.modelDeckBottomY + 0.02, pitch: -0.95, fr: 1.85 },
+  Noseblunt: { slide: true, z: 0.37, h: BOARD.modelDeckBottomY + 0.02, pitch: 0.95, fr: 1.85 },
 };
+
+// [height above the contact plane, reach ahead of the board center]: front wheels at hub height, then the nose
+const WALL_PROBES = [
+  [0.05, BOARD.truckAxleZ + BOARD.wheelRadius + 0.02],
+  [0.14, BOARD.length / 2 + 0.03],
+];
+
+const HALF_L = BOARD.length / 2 + 0.01;
 
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const damp = (cur, target, rate, dt) => cur + (target - cur) * (1 - Math.exp(-rate * dt));
+const FLIP_BASE = 0.3; // flip + scoop speed base (slowed way down for technical, readable flips)
+const wrapPi = (a) => a - Math.PI * 2 * Math.round(a / (Math.PI * 2));
 const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
 
 export class SkaterController {
@@ -98,6 +111,7 @@ export class SkaterController {
     this.popT = 10;
     this.popNose = false;
     this.spinRate = 0;
+    this.spinCommit = null;
     this.spinTotal = 0;
     this.airTime = 0;
     this.grab = null;
@@ -110,7 +124,19 @@ export class SkaterController {
     this.susp = { y: 0, v: 0 };
     this.wobble = 0;
     this.grabTw = { r: 0, p: 0 };
+    this.airTw = { p: 0, r: 0, pv: 0, rv: 0 }; // loose in-air board float (feet shifting, catch kick)
+    this.airH = 20;
+    this.setTw = { p: 0, y: 0, r: 0 }; // in-air 'set up' pose: the board is caught angled for the grind you're going for
+    this.boardPose = { p: 0, y: 0, pv: 0, yv: 0 }; // mouse / flick-stick board control in the air (pitch +nose down, yaw)
+    this.poseIn = { u: 0, v: 0 };
+    this.poseActive = false;
+    this.manualTilt = 0.5;
+    this.lag = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0 }; // loose board: trails the rider's rotation, springs back
+    this._prevQuat = this.quat.clone();
     this.revert = null;
+    this.wallie = null; // front wheels up an obstacle's face, waiting for the pop
+    this.wallieAir = null;
+    this.wallieCooldown = 0;
     this.revertVis = 0;
     this.revertWindow = 0;
     this.airPrefix = '';
@@ -183,32 +209,36 @@ export class SkaterController {
   // ---------------------------------------------------------------------------------------
   step(dt, input) {
     this.time += dt;
+    this._input = input;
+    G.y = -GRAVITY * T.gravity; // mod menu: gravity
     if (this.mode === 'bail') return this._bailStep(dt, input);
 
     // ---- flick stick ----
     const hs = this.heelSign;
+    this.padFlick = input.flickSource === 'pad' ? input.flick : null;
     const u = -input.flick.x * hs;
     const v = input.flick.y;
     const canLoad = this.mode === 'ground' || this.mode === 'grind';
-    const holdMode = !!(input.flickHold || input.flickRelease);
-    // mouse late flips: in the air (nothing left to catch) hold, flick a direction, release
+    // mouse late flips: in the air (nothing left to catch) click, flick hard, let go quickly. A longer hold is
+    // board control instead (the mouse angles the board, see boardPose).
     if (this.mode === 'air' && !(this.trick && !this.trick.caught) && !this.lateTrick) {
-      if (input.flickPress) this.airGesture = { u: 0, v: 0, strong: false };
+      if (input.flickPress) this.airGesture = { u: 0, v: 0, strong: false, t0: this.time };
       const ag = this.airGesture;
-      if (ag && input.flickHold && Math.hypot(u, v) > 0.55) {
+      if (ag && input.flickHold && Math.hypot(u, v) > 0.7) {
         ag.u = u;
         ag.v = v;
         ag.strong = true;
       }
-      if (ag && input.flickRelease) {
+      if (ag && (input.flickRelease || this.time - ag.t0 > 0.3)) {
         this.airGesture = null;
-        const e = ag.strong ? this.flick._lateFlick(ag.u, ag.v) : null;
+        const e = ag.strong && input.flickRelease ? this.flick._lateFlick(ag.u, ag.v) : null;
         if (e && this.airTime > 0.08) this._startTrick(e.flips, e.shove, false, true);
       }
     }
-    const lateAllowed = !holdMode && !this.trick && this.airTime > 0.1 && this._heightAboveGround() > 0.5;
+    const lateAllowed = input.flickSource === 'pad' && !this.trick && this.airTime > 0.1 && this._heightAboveGround() > 0.5 && !this.poseActive;
     if (input.flickPress && canLoad) this.flick.reset();
-    let ev = this.flick.update(dt, u, v, { canLoad, airborne: this.mode === 'air', lateAllowed, manual: holdMode });
+    // the mouse pops on its own when the flick reaches the end (like the stick), so you can keep holding into the air
+    let ev = this.flick.update(dt, u, v, { canLoad, airborne: this.mode === 'air', lateAllowed, manual: false });
     if (input.flickRelease) {
       const rel = this.flick.release();
       if (rel) ev = rel;
@@ -247,13 +277,22 @@ export class SkaterController {
     if (this.trick) {
       const tr = this.trick;
       tr.t += dt;
-      if (!tr.caught) {
-        if (input.catch && this.mode === 'air' && tr.t > 0.03) this._catch();
-        else if (this.autoCatch && tr.t >= tr.T) this._catch();
+      if (!tr.caught && input.catch && this.mode === 'air' && tr.t > 0.03) this._catch();
+      // mod menu auto catch: the feet grab it as it comes back upright
+      if (T.autoCatch && !tr.caught && this.mode === 'air' && tr.p >= 0.88 && tr.p - Math.floor(tr.p) >= 0.88) this._catch();
+      // the feet find the board on the LAST time it comes round before you land: no catch button needed.
+      // More air or a faster flick leaves time for another rotation (doubles); click to catch it earlier.
+      if (!tr.caught && this.mode === 'air' && tr.p >= 0.85) {
+        const k = Math.round(tr.p);
+        if (k >= 1 && Math.abs(tr.p - k) < 0.12) {
+          const g = GRAVITY * T.gravity;
+          const h = Math.max(0, this.airH - 0.03);
+          const tLand = (this.vel.y + Math.sqrt(Math.max(0, this.vel.y * this.vel.y + 2 * g * h))) / g;
+          const tNext = (k + 1 - tr.p) / Math.max(0.05, tr.rate);
+          if (tNext > tLand - 0.04) this._catch();
+        }
       }
-      // visual time: frozen once caught (past catches ease back to upright)
-      if (tr.caught) tr.vt = damp(tr.vt, tr.catchT, 30, dt);
-      else tr.vt = tr.t;
+      this._spinTrick(tr, dt);
     }
     this.popT += dt;
     this.flickT = Math.min(1, this.flickT + dt / 0.28);
@@ -270,6 +309,101 @@ export class SkaterController {
     sp.y = clamp(sp.y + sp.v * dt, -0.035, 0.03);
     this.wobble = damp(this.wobble, 0, 3.5, dt);
     this.revertWindow = Math.max(0, this.revertWindow - dt);
+    this.wallieCooldown = Math.max(0, this.wallieCooldown - dt);
+    if (this.mode !== 'ground') this.wallie = null;
+    if (this.mode !== 'air') this.wallieAir = null;
+    // set-up pose: holding W/S (+A/D) in the air means the feet catch the board already angled
+    // for that grind (nose down for a nosegrind, tail down for 5-0, twisted for crooks/smiths)
+    {
+      const tr = this.trick;
+      const flipping = tr && !tr.caught;
+      let spec = null;
+      if (this.mode === 'air' && this.airTime > 0.1 && !this.grab && (input.nose || input.tail)) {
+        const st = Math.abs(input.steer) > 0.35;
+        spec = GRINDS[input.nose ? (st ? 'Crooked Grind' : 'Nosegrind') : st ? 'Smith Grind' : '5-0'];
+      }
+      // mid-flip the feet are still guiding it: only part of the set-up shows until the catch
+      // ...but it levels out as the ground comes up, so a W/S held into a landing doesn't look like a flip
+      const lvl = this.mode === 'air' ? clamp((this.airH - 0.3) / 0.6, 0, 1) : 0;
+      const w = spec ? (flipping ? 0.45 : 1) * 1.3 * lvl : 0;
+      const side = Math.sign(input.steer) || 1;
+      const rate = flipping ? 6 : 11;
+      this.setTw.p = damp(this.setTw.p, spec ? spec.pitch * w : 0, rate, dt);
+      this.setTw.y = damp(this.setTw.y, spec ? (spec.yaw || 0) * side * w : 0, rate, dt);
+      this.setTw.r = damp(this.setTw.r, spec ? (spec.roll || 0) * side * w * 0.6 : 0, rate, dt);
+    }
+    // ---- board control: keep holding the mouse (or the flick stick) in the air and your feet angle the board ----
+    // push up = nose down (nosegrinds / noseslides), pull back = tail down (5-0s, tailslides, land in a manual),
+    // sideways = turn the board under you (crooks, smiths, boardslides). A loose spring: it lags and overshoots.
+    {
+      const bp = this.boardPose;
+      const fx = input.flick.x, fy = input.flick.y;
+      const pad = input.flickSource === 'pad';
+      const held = (pad ? Math.hypot(fx, fy) > 0.22 : !!input.flickHold) && !this.grab;
+      this.poseActive = held && (this.mode === 'grind' || (this.mode === 'air' && this.airTime > 0.06));
+      this.poseIn.u = held ? fx : 0;
+      this.poseIn.v = held ? fy : 0;
+      if (this.mode === 'air') {
+        const tr = this.trick;
+        const w = tr && !tr.caught ? 0.5 : 1; // mid-flip the feet only half guide it
+        const ty = this.poseActive ? -fx * 1.5 * w * T.boardControl : 0;
+        const tp = this.poseActive ? fy * 0.55 * w * T.boardControl : 0;
+        const k = this.poseActive ? 85 : 40;
+        const c = this.poseActive ? 9 : 8;
+        bp.yv += (k * (ty - bp.y) - c * bp.yv) * dt;
+        bp.pv += (k * (tp - bp.p) - c * bp.pv) * dt;
+        bp.y += bp.yv * dt;
+        bp.p += bp.pv * dt;
+      } else bp.y = bp.p = bp.yv = bp.pv = 0;
+    }
+    // ---- loose board: it trails how the rider frame turns (carves, spins, transitions) by a few hundredths of
+    // a second and springs back with a little overshoot, so it never reads as welded to the body ----
+    {
+      const lg = this.lag;
+      _q1.copy(this.quat).multiply(_q2.copy(this._prevQuat).invert());
+      if (_q1.w < 0) _q1.set(-_q1.x, -_q1.y, -_q1.z, -_q1.w);
+      const ang = 2 * Math.acos(Math.min(1, _q1.w));
+      this._prevQuat.copy(this.quat);
+      let wx = 0, wy = 0, wz = 0;
+      if (ang > 1e-6 && ang < 0.4 && this.mode !== 'grind' && this.mode !== 'bail') {
+        const sn = Math.sin(ang / 2);
+        _v1.set(_q1.x / sn, _q1.y / sn, _q1.z / sn).multiplyScalar(Math.min(12, ang / dt));
+        _v1.applyQuaternion(_q2.copy(this.quat).invert());
+        wx = _v1.x;
+        wy = _v1.y;
+        wz = _v1.z;
+      }
+      const LAG = 0.028 * T.boardFloat;
+      lg.vx += (140 * (-wx * LAG - lg.x) - 13 * lg.vx) * dt;
+      lg.vy += (140 * (-wy * LAG - lg.y) - 13 * lg.vy) * dt;
+      lg.vz += (140 * (-wz * LAG - lg.z) - 13 * lg.vz) * dt;
+      lg.x += lg.vx * dt;
+      lg.y += lg.vy * dt;
+      lg.z += lg.vz * dt;
+    }
+    // the board is never dead level in the air: it floats nose-up on the way up, tips a touch toward
+    // the landing on the way down, banks into spins and kicks a little when the feet catch it
+    {
+      const a = this.airTw;
+      let tp = 0, tr = 0;
+      if (this.mode === 'air') {
+        this.airH = this._heightAboveGround();
+        const fade = clamp((this.airH - 0.2) / 0.7, 0, 1);
+        const ph = this.time;
+        tp = (this.vel.y > 0 ? -0.07 : 0.035) + 0.035 * Math.sin(ph * 3.3) + 0.02 * Math.sin(ph * 5.9 + 1.3);
+        tr = -this.spinRate * 0.018 * this.heelSign + 0.03 * Math.sin(ph * 2.6 + 0.7);
+        tp *= fade * T.boardFloat;
+        tr *= fade * T.boardFloat;
+      }
+      a.pv += (-95 * (a.p - tp) - 10 * a.pv) * dt;
+      a.rv += (-80 * (a.r - tr) - 10 * a.rv) * dt;
+      a.p += a.pv * dt;
+      a.r += a.rv * dt;
+      if (this.mode !== 'air') {
+        a.p = damp(a.p, 0, 18, dt);
+        a.r = damp(a.r, 0, 18, dt);
+      }
+    }
     // grab tweaks tilt the board
     const gt = { indy: [0.32, -0.1], melon: [-0.32, -0.1], nose: [0, 0.3], tail: [0, -0.3], stalefish: [-0.4, 0.15], mute: [0.4, 0.15] }[this.grab] || [0, 0];
     this.grabTw.r = damp(this.grabTw.r, gt[0] * this.heelSign, 9, dt);
@@ -279,7 +413,10 @@ export class SkaterController {
     const crouchTarget = this.loading ? 1 : this.mode === 'air' ? 0.15 : 0.12;
     this.crouch = damp(this.crouch, Math.max(crouchTarget, this.landCompress), this.loading ? 16 : 9, dt);
     this.landCompress = damp(this.landCompress, 0, 5, dt);
-    this.lean = damp(this.lean, this.mode === 'ground' || this.mode === 'grind' ? input.steer : input.steer * 0.5, this.mode === 'ground' ? 7 : 5, dt);
+    // mouse held (and not drawing a flick / manual): drag sideways to carve, like leaning with your feet
+    const mouseCarve = this.mode === 'ground' && input.flickHold && this.flick.state === 'idle' && !this.manual && Math.abs(input.flick.x) > 0.12 ? -input.flick.x * 1.25 : 0;
+    const steerIn = clamp(input.steer + mouseCarve, -1, 1);
+    this.lean = damp(this.lean, this.mode === 'ground' || this.mode === 'grind' ? steerIn : input.steer * 0.5, this.mode === 'ground' ? 7 : 5, dt);
     for (const [r, t] of this.railCooldown) {
       if (t - dt <= 0) this.railCooldown.delete(r);
       else this.railCooldown.set(r, t - dt);
@@ -319,12 +456,19 @@ export class SkaterController {
     const fwd = this.fwd(_v1);
     const along = this.vel.dot(fwd);
     const dirSign = along < -0.05 ? -1 : 1;
+    if (this.wallie && this._wallieStep(dt)) return;
 
     // ---- manual ----
+    // mouse (hold click) or flick stick: ease it halfway back = manual, halfway forward = nose manual.
+    // All the way back loads the pop as usual, so manual -> pull back -> flick pops straight out of it.
     const fm = Math.hypot(input.flick.x, input.flick.y);
-    const partial = this.flick.state === 'idle' && fm > 0.28 && fm < 0.66 && input.flickSource === 'pad';
+    const inManual = !!this.manual;
+    const stickHeld = input.flickSource === 'pad' || input.flickHold;
+    const partial = stickHeld && this.flick.state === 'idle' && fm > (inManual ? 0.15 : 0.26) && fm < (inManual ? 0.74 : 0.68) && Math.abs(input.flick.y) > Math.abs(input.flick.x) * 0.7;
     this.padManualT = partial ? (this.padManualT || 0) + dt : 0;
-    const padManual = this.padManualT > 0.15;
+    const padManual = this.padManualT > (inManual ? 0 : 0.12);
+    // how far the stick is eased in sets how high the nose / tail is held (keys: a medium manual)
+    this.manualTilt = damp(this.manualTilt, partial ? clamp((fm - 0.15) / 0.55, 0.15, 1) : 0.55, 10, dt);
     let wantManual = 0;
     if (input.manual || (padManual && input.flick.y < -0.2)) wantManual = 1;
     if (input.noseManual || (padManual && input.flick.y > 0.2)) wantManual = -1;
@@ -359,7 +503,7 @@ export class SkaterController {
     if (!powersliding) {
       // the board turns from how far the rider is leaning (smoothed), not the raw key
       const maxRate = speed < 0.6 ? 2.4 : Math.min(2.3, speed / 1.45 + 0.35);
-      const rate = this.lean * maxRate * (this.manual ? 0.55 : 1) * (this.loading ? 0.75 : 1);
+      const rate = this.lean * maxRate * T.turnSpeed * (this.manual ? 0.55 : 1) * (this.loading ? 0.75 : 1);
       this.rotateAround(n, rate * dt);
       this.vel.applyAxisAngle(n, rate * dt);
       // carving scrubs a little speed
@@ -377,7 +521,7 @@ export class SkaterController {
 
     // pushing
     const canPush = !this.loading && !this.manual && this.slide < 0.1 && n.y > 0.8;
-    if (this.pushT < 0 && input.push && canPush && speed < 9) {
+    if (this.pushT < 0 && input.push && canPush && speed < 9 * T.topSpeed) {
       this.pushT = 0;
     }
     if (this.pushT >= 0) {
@@ -386,8 +530,8 @@ export class SkaterController {
       if (prev < 0.28 && this.pushT >= 0.28) this.emit('push');
       if (this.pushT > 0.28 && this.pushT < 0.6 && canPush) {
         const pushDir = speed > 0.3 ? _v3.copy(this.vel).normalize() : this.fwd(_v3).multiplyScalar(dirSign);
-        const k = Math.max(0, 1 - speed / 7.6);
-        acc.addScaledVector(pushDir, 6.2 * k + 0.4);
+        const k = Math.max(0, 1 - speed / (7.6 * T.topSpeed));
+        acc.addScaledVector(pushDir, (6.2 * k + 0.4) * T.pushForce);
       }
       if (this.pushT >= 1) this.pushT = input.push && canPush ? 0 : -1;
       if (!canPush && this.pushT < 0.28) this.pushT = -1;
@@ -429,16 +573,24 @@ export class SkaterController {
       this.rotateAround(n, ang * (1 - Math.exp(-10 * dt)));
     }
 
-    // ---- walls ahead ----
+    // ---- walls ahead (front wheels at hub height, then the nose) ----
     if (speed > 0.05) {
       const dir = _v1.copy(this.vel).divideScalar(speed);
-      const origin = _v2.copy(this.pos).addScaledVector(n, 0.14);
-      const len = speed * dt + BOARD.length / 2 + 0.03;
-      const hit = this.collision.raycast(origin, dir, len, _hit);
-      if (hit && hit.normal.dot(n) < 0.5) {
+      let hit = null;
+      for (const [hgt, reach] of WALL_PROBES) {
+        const origin = _v2.copy(this.pos).addScaledVector(n, hgt);
+        const h = this.collision.raycast(origin, dir, speed * dt + reach, _hit);
+        if (h && h.normal.dot(n) < 0.5) {
+          hit = h;
+          break;
+        }
+      }
+      if (hit) {
         const vn = this.vel.dot(hit.normal);
         if (vn < 0) {
           const headOn = -vn / speed;
+          // front wheels into a curb / ledge / bench / wall face: wallie window
+          if (headOn > 0.45 && speed > 0.9 && this.wallieCooldown <= 0 && !this.manual && this._startWallie(hit, speed)) return;
           if (-vn > 3.6 && headOn > 0.55) return this._bail('Slammed into a wall', hit.normal);
           this.vel.addScaledVector(hit.normal, -vn * 1.25);
           this.vel.multiplyScalar(0.92);
@@ -458,12 +610,17 @@ export class SkaterController {
     const hit = this.collision.raycast(origin, dirDown, probeUp + snapDown, _hit);
     if (hit && hit.normal.dot(n) > 0.64) {
       const d = hit.distance - probeUp;
-      if (d < -0.07) {
+      if (d < -0.06) {
         // stepped into something taller than the wheels can roll over
-        if (speed > 1.6) return this._bail('Caught a curb', hit.normal);
+        if (speed > 3.2) return this._bail('Caught a curb', hit.normal);
         this.pos.addScaledVector(this.vel, -dt);
         this.vel.multiplyScalar(-0.2);
         return;
+      }
+      if (d < -0.012) {
+        // cracks, lips and little curbs: the wheels bump up over them and scrub a bit of speed
+        this.vel.multiplyScalar(1 - Math.min(0.12, -d * 2));
+        this.susp.v += -d * 5;
       }
       const newN = hit.normal;
       const smooth = newN.dot(n) > 0.965;
@@ -497,6 +654,90 @@ export class SkaterController {
     this.landingNormal.copy(this.normal);
     this.predictT = 0;
     // leaving a steep transition: keep the rider oriented to the wall (vert airs)
+    // vert lock: off a near-vertical lip you come back down the transition instead of drifting onto the deck
+    // (hold W through the lip to carry over onto the deck)
+    const n = this.normal;
+    if (n.y < 0.45 && this.vel.y > 0.5 && !this._input?.push) {
+      const out = _v3.set(n.x, 0, n.z);
+      if (out.lengthSq() > 1e-4) {
+        out.normalize();
+        const vo = this.vel.dot(out);
+        this.vel.addScaledVector(out, 0.35 - vo);
+      }
+    }
+  }
+
+  // Front wheels hit a face: if it's short enough to wallie (curb, ledge, bench, low wall), the nose rides up the
+  // face and the board waits there for the pop. Returns false when it's not wallie-able (too tall / no top).
+  _startWallie(hit, speed) {
+    const n = this.normal;
+    const faceN = _vt.copy(hit.normal);
+    faceN.addScaledVector(n, -faceN.dot(n));
+    if (faceN.lengthSq() < 1e-4) return false;
+    faceN.normalize();
+    const hp = _v2.copy(hit.point);
+    // how tall is it? look down onto its top just behind the face
+    const o = _v3.copy(hp).addScaledVector(faceN, -0.09).addScaledVector(n, 1.4);
+    const top = this.collision.raycast(o, _vu.copy(n).negate(), 1.6, _hit2);
+    if (!top || top.normal.dot(n) < 0.7) return false;
+    const topH = _v3.subVectors(top.point, this.pos).dot(n);
+    if (topH < 0.045 || topH > 1.2) return false;
+    const dist = Math.max(0, _v3.subVectors(this.pos, hp).dot(faceN));
+    const slideDir = _v3.copy(this.vel).addScaledVector(faceN, -this.vel.dot(faceN)).addScaledVector(n, -this.vel.dot(n));
+    const slideSpeed = slideDir.length();
+    if (slideSpeed > 1e-4) slideDir.divideScalar(slideSpeed);
+    // nose angle: up onto a curb's top, or steep against a taller face so the nose clears it
+    const reach = 2 * BOARD.truckAxleZ;
+    const pitch = topH < 0.3 ? Math.asin(clamp((topH + 0.04) / reach, 0, 1)) : 1.0;
+    const before = this._visualSnapBegin();
+    this.wallie = {
+      t: 0,
+      lift: 0,
+      topH,
+      topY: top.point.y,
+      normal: faceN.clone(),
+      dist,
+      // the center creeps up so the front wheels end up against the face at that angle
+      distTarget: Math.max(0.03, reach * Math.cos(pitch) + 0.04 - BOARD.truckAxleZ),
+      pitch,
+      speed,
+      slideDir: slideDir.clone(),
+      slideSpeed: Math.min(slideSpeed, 2.5),
+    };
+    this.vel.set(0, 0, 0);
+    this.pushT = -1;
+    this._visualSnapEnd(before, 30);
+    this.emit('boardHit', { intensity: clamp(speed / 6, 0.2, 0.7) });
+    return true;
+  }
+
+  // front wheels pressed up the face, waiting for the pop (ollie / flick). No pop: the wheels drop back off it.
+  _wallieStep(dt) {
+    const w = this.wallie;
+    w.t += dt;
+    w.lift = Math.min(1, w.lift + dt / 0.08);
+    const into = _v3.copy(w.normal).negate();
+    const gap = w.dist - w.distTarget;
+    if (gap > 0) {
+      const mv = Math.min(gap, dt * 3);
+      this.pos.addScaledVector(into, mv);
+      w.dist -= mv;
+    }
+    w.slideSpeed *= Math.exp(-4 * dt);
+    this.vel.copy(w.slideDir).multiplyScalar(w.slideSpeed);
+    this.pos.addScaledVector(this.vel, dt);
+    if (w.t < 0.34) return true;
+    const before = this._visualSnapBegin();
+    this.wallie = null;
+    this.wallieCooldown = 0.45;
+    this._visualSnapEnd(before, 14);
+    if (w.speed > 4.6 && w.topH > 0.14) {
+      this._bail(w.topH > 0.6 ? 'Slammed into a wall' : 'Caught a curb', w.normal);
+      return true;
+    }
+    this.vel.copy(w.normal).multiplyScalar(0.4 + w.speed * 0.12);
+    this.emit('boardHit', { intensity: 0.3 });
+    return false;
   }
 
   manualEndOnAir() {
@@ -515,8 +756,12 @@ export class SkaterController {
     const up = this.up(_v1);
     const fwd = this.fwd(_v2);
     const fakie = this.vel.dot(fwd) < -0.2;
-    let popSpeed = 2.05 + 1.75 * ev.power;
+    // fingerboard-crisp pop: a snappy, fully loaded flick pops a lot higher than a lazy one
+    let popSpeed = (2.2 + 2.0 * ev.power) * T.pop;
     const fromGrind = this.mode === 'grind';
+    const wallie = this.mode === 'ground' ? this.wallie : null;
+    const wallieBefore = wallie ? this._visualSnapBegin() : null;
+    this.wallie = null;
     let popOut = null;
     if (fromGrind) {
       popSpeed *= 0.8;
@@ -528,13 +773,40 @@ export class SkaterController {
     if (this.manual) {
       this.manualEndOnAir();
     }
-    if (this.mode === 'ground') this.vel.addScaledVector(up, -this.vel.dot(up));
-    const dir = _v3.copy(up);
-    if (up.y > 0.3) dir.multiplyScalar(0.82).addScaledVector(Y, 0.18).normalize();
-    this.vel.addScaledVector(dir, popSpeed);
+    if (wallie) {
+      // Wallie: the front wheels are up on the obstacle's face, the tail snaps off the ground and the board uses
+      // the face as its ramp: straight up the wall, then carried over the top onto it.
+      // Up first (the wheels are still against the face), then the forward speed comes back once the
+      // board is above the top, so it carries over onto it instead of bouncing off the face.
+      const g = GRAVITY * T.gravity;
+      const vy = Math.max(popSpeed * 0.92, Math.sqrt(2 * g * (wallie.topH + 0.26))) * (0.95 + 0.1 * ev.power);
+      this.vel.copy(wallie.slideDir).multiplyScalar(wallie.slideSpeed * 0.8);
+      this.vel.y = vy;
+      this.wallieAir = {
+        into: wallie.normal.clone().negate().setY(0).normalize(),
+        vh: clamp(wallie.speed * 0.85, 1.6, 4),
+        topY: wallie.topY + 0.06,
+      };
+    } else {
+      if (this.mode === 'ground') this.vel.addScaledVector(up, -this.vel.dot(up));
+      const dir = _v3.copy(up);
+      if (up.y > 0.3) dir.multiplyScalar(0.82).addScaledVector(Y, 0.18).normalize();
+      this.vel.addScaledVector(dir, popSpeed);
+    }
     if (popOut) this.vel.add(popOut);
-    // pre-wound spin
+    // body english: leaning at the pop throws the board's travel toward the lean
+    if (!fromGrind && !wallie && Math.abs(this.lean) > 0.05) this.vel.applyAxisAngle(Y, this.lean * 0.14 * T.airControl);
+    // pre-wound spin. Holding A/D hard through the pop commits the hips to a 180 (FS / BS flips,
+    // 180 ollies): the back foot scoops it round and the rotation finishes on its own.
     this.spinRate = this.lean * 4.2;
+    this.spinCommit = null;
+    if (Math.abs(this.lean) > 0.55 && !fromGrind) {
+      const d = Math.sign(this.lean);
+      const fh = this.fwd(_v3);
+      const rel0 = this.vel.x * this.vel.x + this.vel.z * this.vel.z > 1 ? Math.atan2(this.vel.z * fh.x - this.vel.x * fh.z, this.vel.x * fh.x + this.vel.z * fh.z) : 0;
+      this.spinCommit = { dir: d, target: (Math.round(rel0 / Math.PI) + d) * Math.PI, flip: !!(ev.flips && !ev.shove) };
+      this.spinRate = d * 6.5 * T.spinSpeed;
+    }
     this.exitTurn = 0;
     this.spinTotal = 0;
     this.mode = 'air';
@@ -543,27 +815,49 @@ export class SkaterController {
     this.slide = 0;
     this.popT = 0;
     this.popNose = ev.nose;
+    this.popPower = ev.power ?? 0.7;
     this.popped = true;
     this.grabs.clear();
     this.grab = null;
     this.landingNormal.copy(this.normal);
     this.predictT = 0;
     this.airFakie = fakie && !ev.nose;
-    this.airPrefix = ev.nose ? 'Nollie ' : this.airFakie ? 'Fakie ' : '';
+    this.airPrefix = wallie ? 'Wallie ' : ev.nose ? 'Nollie ' : this.airFakie ? 'Fakie ' : '';
     this.airTrick = null; // set when a flip trick is caught
     this.lateTrick = null;
     this.airGesture = null;
     this.trick = null;
-    if (ev.flips || ev.shove || ev.imp) this._startTrick(ev.flips, ev.shove, ev.nose, false, ev.imp || 0);
+    if (ev.flips || ev.shove || ev.imp) this._startTrick(ev.flips, ev.shove, ev.nose, false, ev.imp || 0, ev.flickSpeed ?? ev.power);
+    if (this.trick && this.spinCommit?.flip) this.trick.scoop = this.spinCommit.dir; // FS / BS flip
+    if (wallieBefore) this._visualSnapEnd(wallieBefore, 12);
     this.emit('pop', { power: ev.power });
   }
 
   // Tricks rotate continuously until the rider catches them. One period T brings the board
   // back upright once (a kickflip); catching after 2T makes it a double, etc.
-  _startTrick(flips, shove, nollie, late, imp = 0) {
+  // `speed` (0..1) is how fast the flick was: it scales the flip like Skate 3 (0.5x lazy .. 1.25x snappy)
+  _startTrick(flips, shove, nollie, late, imp = 0, speed = 0.6) {
     const hs = this.heelSign;
-    const T = imp ? 0.4 : 0.26 + 0.08 * Math.abs(flips) + 0.06 * Math.abs(shove);
+    const P = imp ? 0.4 : 0.26 + 0.08 * Math.abs(flips) + 0.06 * Math.abs(shove);
+    // flick speed sets the spin: a lazy flick is a slow floaty flip, a snappy one can go round twice
+    // mod menu: flip speed scales the flip, scoop speed the shuv / impossible
+    // base is half the old speed (more time to see / steer the board); the sliders scale from there
+    const mult = FLIP_BASE * (flips ? T.flipSpeed : 1) * (shove || imp ? T.scoopSpeed : 1);
+    let rate = (1 / P) * (0.5 + 0.75 * clamp(speed, 0, 1)) * 1.25 * mult;
+    // flip consistency (mod menu, on by default): slow is the point, but the board should still get round
+    // by the moment you touch down (the landing catch stomps the last bit home). Off = as slow as the sliders say.
+    if (!late && T.flipAssist && this.vel.y > 0.3) {
+      const tAir = (2 * this.vel.y) / (GRAVITY * T.gravity);
+      const tau = 0.98 * tAir;
+      const F = 1.5 * mult * mult;
+      rate = Math.max(rate, (1 / tau + (F * tau) / 2) * (1 + 0.08 * clamp(speed, 0, 1)));
+    }
     this.trick = {
+      p: 0, // rotation phase in periods (1 = board back upright once)
+      rate, // periods / second
+      mult, // speed multiplier: the settle / catch rates scale with it so slow flips stay slow
+      target: 0, // upright the board is heading for once caught / settling
+      settling: false,
       flips,
       shove,
       imp,
@@ -571,7 +865,7 @@ export class SkaterController {
       nollie,
       t: 0,
       vt: 0,
-      T,
+      T: P,
       caught: false,
       catchT: 0,
       quality: null,
@@ -589,12 +883,58 @@ export class SkaterController {
     this.emit('flip', { flips, shove });
   }
 
-  // Catch timing: the board is upright at t = kT. Clicking a little before (feet meet the board
-  // as it comes around) or just after is clean; wider misses are sketchy; anything else is crooked.
-  _catchQuality(t, T) {
-    const k = Math.round(t / T);
-    const d = t - k * T; // <0: early (board still coming around), >0: late
-    if (k === 0) return t < 0.09 ? { k: 0, q: 'clean' } : { k: 0, q: 'bad' };
+  // Spin with momentum. Board friction slows the rotation; once it's slow the feet find it on the
+  // next upright on their own (no catch needed). A catch doesn't freeze the board: it brakes it
+  // smoothly into the next upright ahead, keeping its direction.
+  _spinTrick(tr, dt) {
+    const m = tr.mult ?? 1;
+    const SETTLE_RATE = 1.4 * m; // below this the feet start guiding the board home
+    const FRICTION = 1.5 * m * m; // periods / s^2 of natural spin decay (slow flips float, barely any drag)
+    if (!tr.caught && !tr.settling) {
+      tr.rate = Math.max(0, tr.rate - FRICTION * dt);
+      if (tr.rate < SETTLE_RATE) {
+        tr.settling = true;
+        tr.target = Math.max(1, Math.ceil(tr.p - 0.1));
+      }
+    }
+    if (tr.caught || tr.settling) {
+      const rem = tr.target - tr.p;
+      if (rem <= 0.0005) {
+        tr.p = tr.target;
+        tr.rate = 0;
+        if (!tr.caught) this._settle(tr);
+      } else {
+        // caught: the feet grab it and bring it home in ~0.1s whatever speed it was spinning (a slow flip
+        // speeds up into the feet, a fast one is braked). Settling on its own: it keeps floating round.
+        const want = tr.caught ? Math.max(0.6, rem * 9) : Math.max(1.2 * Math.max(m, 0.5), Math.min(tr.rate, rem * 8));
+        tr.rate = damp(tr.rate, want, 18, dt);
+        tr.p = Math.min(tr.target, tr.p + tr.rate * dt);
+      }
+    } else tr.p += tr.rate * dt;
+    tr.vt = tr.p * tr.T; // visual time (kept for the board pose)
+  }
+
+  // the board came home without a catch: counts as a clean trick of that many rotations
+  _settle(tr) {
+    tr.caught = true;
+    tr.quality = tr.quality || 'clean';
+    tr.k = tr.target;
+    tr.catchT = tr.t;
+    this._recordTrick(tr, tr.target);
+  }
+
+  _recordTrick(tr, k) {
+    const done = { flips: tr.flips * k, shove: tr.shove * k, imp: tr.imp * k, nollie: tr.nollie };
+    if (tr.late) this.lateTrick = done;
+    else this.airTrick = done;
+  }
+
+  // catch quality from how far the board is from an upright when the feet go down
+  _catchQuality(t, period) {
+    const p = t / period;
+    const k = Math.round(p);
+    const d = (p - k) * 0.34; // in seconds of a kickflip, as before
+    if (k === 0) return p < 0.3 ? { k: 0, q: 'clean' } : { k: 0, q: 'bad' };
     if (d >= -0.12 && d <= 0.1) return { k, q: 'clean' };
     if (d >= -0.19 && d <= 0.17) return { k, q: 'sketchy' };
     return { k, q: 'bad' };
@@ -603,30 +943,45 @@ export class SkaterController {
   _catch() {
     const tr = this.trick;
     if (!tr || tr.caught) return;
-    const { k, q } = this._catchQuality(tr.t, tr.T);
+    // the feet meet the board on the next upright ahead (or the one just passed)
+    const target = Math.max(1, tr.p - Math.floor(tr.p) < 0.22 ? Math.floor(tr.p) : Math.ceil(tr.p));
+    // grabbing it when it's still well short of coming round is sloppy
+    const q = target - tr.p > 0.55 ? 'sketchy' : 'clean';
     tr.caught = true;
-    tr.k = k;
+    tr.target = target;
+    tr.k = target;
     tr.quality = q;
-    tr.catchT = q === 'bad' ? tr.t : k * tr.T;
-    // early catches keep rotating into place; the visual time eases to catchT
-    if (q !== 'bad' && k > 0) {
-      const done = { flips: tr.flips * k, shove: tr.shove * k, imp: tr.imp * k, nollie: tr.nollie };
-      if (tr.late) this.lateTrick = done;
-      else this.airTrick = done;
-    }
+    tr.catchT = tr.t;
+    // the feet slap it down: front foot first gives a little nose dip, then it floats back
+    // the feet slap it down: front foot first on flips (nose dips), back foot first on scoops (tail dips)
+    this.airTw.pv += (tr.flips ? 1.9 : -1.6) * (q === 'clean' ? 1 : 1.6) * T.boardFloat;
+    this.airTw.rv += -Math.sign(tr.flipPer || 1) * 0.9 * T.boardFloat;
+    this._recordTrick(tr, target);
     this.emit('catch', { quality: q });
   }
 
-  // Landing a trick that was never caught is always a bail (the feet never found the board).
+  // Landing catch: touching down on a board that's (nearly) back around counts, the feet stomp the last bit
+  // home. Lined up = clean, a bit off = sketchy. Still mid-flip = bail (the feet never found it).
   _uncaughtLanding() {
     const tr = this.trick;
     if (!tr || tr.caught) return null;
+    const k = Math.round(tr.p);
+    const off = tr.p - k;
+    if (k >= 1 && off > -0.3 && off < 0.28) {
+      this._recordTrick(tr, k);
+      return Math.abs(off) < 0.12 ? 'clean' : 'sketchy';
+    }
     return 'bail';
   }
 
   // ---------------------------------------------------------------------------------------
   _airStep(dt, input) {
     this.airTime += dt;
+    const wa = this.wallieAir;
+    if (wa && (this.pos.y >= wa.topY || this.vel.y < 0 || this.airTime > 0.6)) {
+      this.vel.addScaledVector(wa.into, wa.vh);
+      this.wallieAir = null;
+    }
     // gravity + drag
     const speed = this.vel.length();
     this.vel.addScaledVector(G, dt);
@@ -636,10 +991,53 @@ export class SkaterController {
     const up = this.up(_v1);
     // holding W/S turns A/D into grind modifiers (smith, feeble, crooked, blunts) instead of spinning
     const spinInput = input.nose || input.tail ? 0 : input.steer;
-    if (Math.abs(spinInput) > 0.1) this.spinRate = damp(this.spinRate, spinInput * 7.2, 5.5, dt);
-    else this.spinRate = damp(this.spinRate, 0, 2.6, dt);
+    const holding = Math.abs(spinInput) > 0.1;
+    // Where the board points relative to where you're travelling, unwrapped so whole half-turns count.
+    // Landing lined up means a multiple of 180 (forward or fakie).
+    const fh = this.fwd(_v2);
+    let relU = this.spinTotal;
+    if (this.vel.x * this.vel.x + this.vel.z * this.vel.z > 1) {
+      const rel = Math.atan2(this.vel.z * fh.x - this.vel.x * fh.z, this.vel.x * fh.x + this.vel.z * fh.z);
+      relU = this.spinTotal + wrapPi(rel - this.spinTotal);
+    }
+    const c = this.spinCommit;
+    if (c && Math.sign(spinInput) === -c.dir) this.spinCommit = null; // pulled the other way: abandon
+    // committed: rotation is guided to the commit target, and holding the same way once it's there
+    // keeps it there (keyboard players hold A the whole trick). Release and press again to spin on.
+    if (c && c.reached && !holding) this.spinCommit = null;
+    const committed = !!this.spinCommit && (Math.sign(spinInput) === c.dir || !holding);
+    if (holding && !committed) {
+      // free spin while A/D is held
+      this.spinRate = damp(this.spinRate, spinInput * 7.2 * T.spinSpeed, 5.5, dt);
+      this.spinCommit = null;
+    } else if (!T.spinAssist && !this.spinCommit) {
+      // land assist off (mod menu): the spin just bleeds off wherever it is
+      this.spinRate = damp(this.spinRate, 0, 2.6, dt);
+    } else {
+      // Let go (or committed from the pop): the hips carry the rotation round to a lined-up half
+      // turn, like Reynolds says: once it's past ~90, keep the motion going and land it backwards.
+      // Short of that it comes back to where it started. No more stopping dead at 90 and landing sideways.
+      // look a little ahead: a fast spin let go just short of 90 still has the momentum to finish
+      const frac = (relU + this.spinRate * 0.09) / Math.PI;
+      const dir = Math.sign(this.spinRate) || 1;
+      let target = dir > 0 ? Math.floor(frac + 1e-6) : Math.ceil(frac - 1e-6);
+      if (Math.abs(frac - target) > 0.45 && Math.abs(this.spinRate) > 0.6) target += dir;
+      else if (Math.abs(frac - Math.round(frac)) <= 0.45) target = Math.round(frac);
+      let goal = target * Math.PI;
+      if (this.spinCommit) goal = c.dir > 0 ? Math.max(goal, c.target) : Math.min(goal, c.target);
+      const rem = goal - relU;
+      const mag = Math.abs(rem) > 0.3 ? Math.min(10 * T.spinSpeed, Math.max(3.5 * T.spinSpeed, Math.abs(rem) * 9)) : Math.abs(rem) * 9;
+      this.spinRate = damp(this.spinRate, Math.sign(rem) * mag, 10, dt);
+      if (this.spinCommit && Math.abs(rem) < 0.05) this.spinCommit.reached = true;
+    }
     this.rotateAround(up, this.spinRate * dt);
     this.spinTotal += this.spinRate * dt;
+    // air control: only an actively held A/D bends your line (lightly mid-trick), plus a small drift
+    if (holding && !committed) this.vel.applyAxisAngle(Y, this.spinRate * dt * (this.trick ? 0.1 : 0.22) * T.airControl);
+    if (holding && !committed && this.airTime > 0.05) {
+      const side = _v3.set(this.vel.z, 0, -this.vel.x); // same turning sense as the spin
+      if (side.lengthSq() > 1e-4) this.vel.addScaledVector(side.normalize(), spinInput * 1.1 * T.airControl * dt);
+    }
     if (this.exitTurn) {
       const stepA = Math.sign(this.exitTurn) * Math.min(Math.abs(this.exitTurn), 9 * dt);
       this.rotateAround(up, stepA);
@@ -697,6 +1095,20 @@ export class SkaterController {
         }
       }
     }
+    // keep the nose and tail out of walls: the swept ray above only covers the board's center
+    if (this.airTime > 0.03) {
+      const f = this.fwd(_v3);
+      const uo = this.up(_vu);
+      for (const s of [1, -1]) {
+        const o = _v1.copy(this.pos).addScaledVector(uo, 0.09);
+        const h = this.collision.raycast(o, _v2.copy(f).multiplyScalar(s), HALF_L, _hit);
+        if (h && h.normal.y < 0.25 && h.normal.dot(uo) < 0.7) {
+          this.pos.addScaledVector(h.normal, HALF_L - h.distance);
+          const vn = this.vel.dot(h.normal);
+          if (vn < 0) this.vel.addScaledVector(h.normal, -vn * 1.1);
+        }
+      }
+    }
     // contact probe along the rider's down axis (catches landings while moving parallel to a surface)
     if (this.airTime > 0.08) {
       const u2 = this.up(_v1);
@@ -733,6 +1145,12 @@ export class SkaterController {
 
   _land(hit) {
     const m = new THREE.Vector3().copy(hit.normal);
+    // the board lands where your feet turned it: fold the board-control yaw into the rider before judging
+    const bp = this.boardPose;
+    if (Math.abs(bp.y) > 1e-4) {
+      this.rotateAround(this.up(_v1), bp.y);
+      bp.y = bp.yv = 0;
+    }
     const up = this.up(new THREE.Vector3());
     const vn = -this.vel.dot(m);
     const vt = _vt.copy(this.vel).addScaledVector(m, vn);
@@ -741,10 +1159,13 @@ export class SkaterController {
     if (up.dot(m) < 0.55) return this._bail('Over-rotated', m);
     let sketchy = false;
     if (this.trick) {
-      if (!this.trick.caught) {
-        if (this._uncaughtLanding() === 'bail') return this._bail("Didn't catch it", m);
-        sketchy = true;
-      }
+      const tr = this.trick;
+      if (!tr.caught) {
+        const r = this._uncaughtLanding();
+        if (r === 'bail') return this._bail("Didn't catch it", m);
+        if (r === 'sketchy') sketchy = true;
+      } else if (tr.target - tr.p > 0.35) return this._bail('Still flipping', m);
+      else if (tr.target - tr.p > 0.12) sketchy = true;
       if (this.trick.quality === 'bad') return this._bail('Caught it crooked', m);
       if (this.trick.quality === 'sketchy') sketchy = true;
     }
@@ -762,11 +1183,14 @@ export class SkaterController {
       const c = f.dot(vd);
       const target = c >= 0 ? vd : vd.clone().negate();
       const ang = Math.acos(clamp(Math.abs(c), -1, 1));
-      if (ang > (48 * Math.PI) / 180) return this._bail('Landed sideways', m);
-      if (ang > (22 * Math.PI) / 180) sketchy = true;
+      if (ang > (T.landTolerance * Math.PI) / 180) return this._bail('Landed sideways', m);
+      if (ang > (T.landTolerance * 0.46 * Math.PI) / 180) sketchy = true;
       yawFix = Math.atan2(_v2.crossVectors(f, target).dot(m), f.dot(target));
     }
     // ---- commit ----
+    // the board doesn't teleport onto its wheels: the last bit of flip, the yaw line-up and the drop out of the
+    // tucked lift blend in over a few frames (wheels slap down instead of the pose snapping)
+    const before = this._visualSnapBegin();
     this.mode = 'ground';
     this.pos.copy(hit.point);
     this.normal.copy(m);
@@ -784,12 +1208,26 @@ export class SkaterController {
     }
     // shove-its leave the board turned around under the rider
     this.boardYawOffset = 0; // board visual is rebuilt from rider frame each frame
+    this.airTw.p = this.airTw.r = this.airTw.pv = this.airTw.rv = 0;
+    this.setTw.p = this.setTw.y = this.setTw.r = 0;
+    // still holding the board tail-down / nose-down (mouse eased back / forward): land straight into a manual
+    const pv = this.poseIn.v;
+    if (this.poseActive && Math.abs(pv) > 0.15 && Math.abs(pv) < 0.8 && vtLen > 0.6) {
+      this.manual = pv < 0 ? 1 : -1;
+      this.manualT = 0;
+      this.padManualT = 0.2;
+      this.manualTilt = clamp((Math.abs(pv) - 0.15) / 0.55, 0.15, 1);
+      this.emit('manualStart');
+    }
+    bp.p = bp.pv = 0;
+    this._visualSnapEnd(before, 15);
     this.emit(vn > 6.5 ? 'landHard' : 'land', { intensity: clamp(vn / 6, 0.2, 1) });
 
     const name = this._composeAirName();
     if (name) this._trickCallout(name, sketchy ? 'sketchy' : 'clean');
     this._resetAirNaming();
     this.spinRate = 0;
+    this.spinCommit = null;
     if (this.flick.state !== 'idle') this.flick.reset();
   }
 
@@ -811,7 +1249,7 @@ export class SkaterController {
         parts.push((spins >= 180 ? '' : prefix) + trickName(t.flips, t.shove, false, false, t.imp));
       }
     } else if (spins >= 180) parts.push(`${prefix}${side} ${spins}`);
-    else if (this.popped) parts.push(prefix ? prefix.trim() === 'Nollie' ? 'Nollie' : prefix + 'Ollie' : 'Ollie');
+    else if (this.popped) parts.push(prefix ? (prefix.trim() === 'Nollie' || prefix.trim() === 'Wallie' ? prefix.trim() : prefix + 'Ollie') : 'Ollie');
     if (this.lateTrick) parts.push('Late ' + trickName(this.lateTrick.flips, this.lateTrick.shove, false, false, this.lateTrick.imp));
     for (const g of this.grabs) parts.push(GRAB_NAMES[g]);
     if (!parts.length && this.airTime > 0.55) parts.push('Air');
@@ -884,6 +1322,10 @@ export class SkaterController {
     const nose = input.nose;
     const tail = input.tail;
     const steer = Math.abs(input.steer) > 0.35 ? Math.sign(input.steer) : 0;
+    const pg = this._poseGrind(g);
+    if (pg !== undefined) return pg;
+    const sg = this.mode === 'air' ? this._stickGrind(g) : null;
+    if (sg) return sg;
     // steering toward the far side of the rail (the side you didn't come from)
     const left = _v1.crossVectors(Y, g.dir).normalize();
     const toward = steer !== 0 && left.dot(g.approach) * steer < 0;
@@ -897,12 +1339,50 @@ export class SkaterController {
     return null;
   }
 
+  // Board control (mouse held / flick stick): the grind comes from how your feet angled the board.
+  //   grinds: up (nose down) nosegrind · back (tail down) 5-0 · + sideways: crooked / overcrook, smith / feeble
+  //   slides (board across the rail): up noseslide · back tailslide · pushed all the way: noseblunt / bluntslide
+  // Returns undefined when the board isn't being controlled (keys / grind wheel decide), null = the base grind.
+  _poseGrind(g) {
+    if (!this.poseActive) return undefined;
+    // pulling back to load the pop out of a grind isn't a request to switch to 5-0
+    if (this.mode === 'grind' && (this.loading || this.flick.loaded)) return undefined;
+    const { u, v } = this.poseIn;
+    const nose = v > 0.3, tail = v < -0.3, hard = Math.abs(v) > 0.8;
+    if (g.slide) {
+      if (nose) return hard ? 'Noseblunt' : 'Noseslide';
+      if (tail) return hard ? 'Bluntslide' : 'Tailslide';
+      return null;
+    }
+    // sideways on the mouse turns the nose; nose toward the side you came from = crooked, away = overcrook
+    const steer = Math.abs(u) > 0.25 ? -Math.sign(u) : 0;
+    const left = _v1.crossVectors(Y, g.dir).normalize();
+    const toward = steer !== 0 && left.dot(g.approach) * steer < 0;
+    if (tail) return steer ? (toward ? 'Feeble Grind' : 'Smith Grind') : '5-0';
+    if (nose) return steer ? (toward ? 'Overcrook' : 'Crooked Grind') : 'Nosegrind';
+    return null;
+  }
+
+  // Gamepad: hold the flick stick toward a direction as you land on a rail (skate-style grind wheel).
+  //   N nosegrind · S 5-0 · NW crooked · NE overcrook · SW willy · SE salad · W feeble · E smith
+  _stickGrind(g) {
+    const f = this.padFlick;
+    if (!f || Math.hypot(f.x, f.y) < 0.55) return null;
+    const x = f.x * this.heelSign; // + = screen-right for regular, mirrored for goofy
+    const ang = (Math.atan2(f.y, x) * 180) / Math.PI;
+    const sector = Math.round(((ang + 360) % 360) / 45) % 8;
+    // slides: board angle picks boardslide / lipslide; the stick only adds nose / tail / blunt variants
+    if (g.slide) return [null, 'Noseblunt', 'Noseslide', null, null, null, 'Tailslide', 'Bluntslide'][sector];
+    return ['Smith Grind', 'Overcrook', 'Nosegrind', 'Crooked Grind', 'Feeble Grind', 'Willy', '5-0', 'Salad'][sector];
+  }
+
   _startGrind(g, input) {
     const { rail, c, railUp } = g;
     const before = this._visualSnapBegin();
     const vAlong = this.vel.dot(g.dir);
     const gdir = g.dir.clone().multiplyScalar(Math.sign(vAlong) || 1);
-    const fwd = this.fwd(new THREE.Vector3());
+    // where the BOARD points (rider facing + the yaw your feet put on it in the air) picks grind vs slide
+    const fwd = this.fwd(new THREE.Vector3()).applyAxisAngle(this.up(_v1), this.boardPose.y);
     const fwdH = fwd.clone().addScaledVector(railUp, -fwd.dot(railUp)).normalize();
     const cosA = Math.abs(fwdH.dot(gdir));
     const slide = cosA < 0.64;
@@ -951,7 +1431,7 @@ export class SkaterController {
     // flip-in: the rail counts as the catch if the board is (nearly) back around
     if (this.trick) {
       if (!this.trick.caught) {
-        const { k, q } = this._catchQuality(this.trick.t, this.trick.T);
+        const { k, q } = this._catchQuality(this.trick.p * this.trick.T, this.trick.T);
         if (q === 'bad' || k === 0) {
           this.grind = null;
           return this._bail("Didn't catch it");
@@ -977,6 +1457,7 @@ export class SkaterController {
     grind.prefix = pre && pre !== 'Ollie' && pre !== 'Air' && pre !== 'Nollie' && pre !== 'Fakie Ollie' ? pre + ' ' : '';
     this._resetAirNaming();
     this.spinRate = 0;
+    this.spinCommit = null;
     this.exitTurn = 0;
     this._placeOnRail();
     this._visualSnapEnd(before, 26);
@@ -1018,6 +1499,18 @@ export class SkaterController {
         this.emit(GRINDS[want].slide ? 'slideStart' : 'grindStart', { kind: g.kind, switch: true });
       }
     } else g.pending = null;
+    // Grind Exit: hold steer (A/D or left stick) with no grind modifier to roll off the rail to that side
+    if (g.t > 0.3 && !input.nose && !input.tail && !want && Math.abs(input.steer) > 0.55 && !this.flick.loaded) {
+      g.exitT = (g.exitT || 0) + dt;
+      if (g.exitT > 0.14) {
+        const side = _v1.crossVectors(Y, g.dir).normalize().multiplyScalar(Math.sign(input.steer));
+        const name = g.exitName = 'Grind Exit';
+        this.vel.addScaledVector(side, 2.2).addScaledVector(Y, 0.9);
+        this._endGrind(true);
+        this.emit('grindExit', { name });
+        return;
+      }
+    } else g.exitT = 0;
     const fr = (RAIL_KINDS[g.kind]?.friction ?? 0.8) * spec.fr;
     g.speed += (G.dot(g.dir) - fr * Math.sign(g.speed || 1)) * dt;
     g.c.addScaledVector(g.dir, g.speed * dt);
@@ -1092,10 +1585,13 @@ export class SkaterController {
     const b = this.board;
     const m = this.boardMatrix(new THREE.Matrix4());
     m.decompose(b.pos, b.quat, _v1);
-    b.vel.copy(this.vel).multiplyScalar(0.85);
-    b.vel.y = Math.max(b.vel.y, 0) + 1.5 + Math.random();
-    if (normal) b.vel.addScaledVector(normal, 1.5);
-    b.ang.set((Math.random() - 0.5) * 14, (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 14);
+    // the board carries on roughly where it was going: a small kick up, a lazy tumble
+    b.vel.copy(this.vel).multiplyScalar(0.7);
+    b.vel.y = Math.max(b.vel.y * 0.5, 0) + 0.6 + Math.random() * 0.5;
+    if (normal) b.vel.addScaledVector(normal, 0.9);
+    const hs = b.vel.length();
+    if (hs > 9) b.vel.multiplyScalar(9 / hs);
+    b.ang.set((Math.random() - 0.5) * 5, (Math.random() - 0.5) * 3.5, (Math.random() - 0.5) * 5);
     this.emit('bail', { reason, velocity: this.vel.clone() });
   }
 
@@ -1109,8 +1605,16 @@ export class SkaterController {
     const b = this.board;
     b.vel.addScaledVector(G, dt);
     b.pos.addScaledVector(b.vel, dt);
-    const hit = this.collision.raycast(_v1.copy(b.pos).addScaledVector(Y, 0.4), _v2.set(0, -1, 0), 0.45, _hit);
+    const hit = this.collision.raycast(_v1.copy(b.pos).addScaledVector(Y, 0.4), _v2.set(0, -1, 0), 0.45 + Math.max(0, -b.vel.y) * dt, _hit);
     if (hit) {
+      // settle onto its wheels or its deck, whichever side is closer
+      const bu = _v3.set(0, 1, 0).applyQuaternion(b.quat);
+      const want = bu.dot(hit.normal) >= 0 ? hit.normal : _v2.copy(hit.normal).negate();
+      if (b.vel.length() < 4) {
+        _q1.setFromUnitVectors(bu, want);
+        _q2.identity().slerp(_q1, 1 - Math.exp(-6 * dt));
+        b.quat.premultiply(_q2).normalize();
+      }
       b.pos.y = Math.max(b.pos.y, hit.point.y + 0.03);
       const vn = b.vel.dot(hit.normal);
       if (vn < 0) {
@@ -1195,29 +1699,86 @@ export class SkaterController {
     const sy = this.susp.y - (this.mode === 'ground' ? this.crouch * 0.01 : 0);
     if (sy) local.multiply(t.makeTranslation(0, sy, 0));
     if (this.wobble > 0.002) local.multiply(tmp.makeRotationY(this.wobble * Math.sin(this.time * 19)));
+    const lg = this.lag;
+    if (Math.abs(lg.x) + Math.abs(lg.y) + Math.abs(lg.z) > 1e-5) {
+      const lp = BOARD.pivotY;
+      local.multiply(t.makeTranslation(0, lp, 0)).multiply(tmp.makeRotationY(lg.y)).multiply(tmp.makeRotationX(lg.x)).multiply(tmp.makeRotationZ(lg.z)).multiply(t.makeTranslation(0, -lp, 0));
+    }
     // trick rotations about the board's center
     let pitch = 0;
     let shove = 0;
     let flip = 0;
     let lift = 0;
     let imp = 0;
-    // ollie pop pitch: tail strike then level out
-    if (this.popT < 0.4) {
+    // Frame by frame, a real pop/flip goes: tail snaps, nose shoots up ~30 deg pivoting on the tail;
+    // the front foot drags up the grip and levels it out (overshooting a hair nose-down); on a flip
+    // the board keeps its nose up while it starts rolling, drifts sideways off the flicking toe,
+    // rises up into the tucked knees, and gets stomped back down level when the feet catch it.
+    const dir = this.popNose ? -1 : 1;
+    let popPitch = 0;
+    if (this.popT < 1) {
       const tt = this.popT;
-      const p = tt < 0.07 ? tt / 0.07 : Math.max(0, 1 - (tt - 0.07) / 0.28);
-      pitch = -0.42 * easeInOut(p) * (this.popNose ? -1 : 1);
+      popPitch = tt < 0.08 ? -0.5 * (1 - (1 - tt / 0.08) ** 2) : -0.5 * Math.exp(-(tt - 0.08) * 6) * Math.cos((tt - 0.08) * 8);
+      // a snappy, fully loaded pop snaps the tail harder and stands the nose up steeper
+      popPitch *= dir * T.popAngle * (0.75 + 0.45 * (this.popPower ?? 0.7));
     }
+    let flickYaw = 0;
+    let driftX = 0;
     if (this.trick) {
       const tr = this.trick;
       const ph = tr.vt / tr.T;
       flip = tr.flipPer * ph;
       shove = tr.shovePer * ph;
       imp = tr.impPer * ph;
-      lift = Math.min(1, tr.vt / 0.12) * 0.1 * (tr.caught ? Math.max(0, 1 - (tr.t - tr.catchT) / 0.15) : 1);
+      // after the catch the feet press it down and it settles over ~0.2s
+      const sinceCatch = tr.caught ? tr.t - tr.catchT : 0;
+      const held = tr.caught ? Math.max(0, 1 - sinceCatch / 0.2) ** 2 : 1;
+      const rise = 1 - (1 - Math.min(1, tr.t / 0.22)) ** 2;
+      // flips rise up into the tucked knees; scoops (shuvits, impossibles) stay low and flat under the feet
+      // ...and it comes back down to the feet as it finishes coming round (not hovering until the catch)
+      const arc = Math.max(Math.sin(Math.PI * Math.min(1, ph)), ph > 1 ? 0.35 : 0);
+      lift = (tr.flips ? 0.17 : 0.05) * rise * held * (0.35 + 0.65 * arc);
+      // it drifts a few cm off the flicking foot mid-flip
+      if (tr.flips) driftX = 0.045 * Math.sign(tr.flipPer) * Math.sin(Math.PI * Math.min(1, ph)) * held;
+      // nose stays up while the flip gets going, levels as it comes round
+      const early = Math.max(0, 1 - Math.min(1, ph) / 0.65);
+      // FS/BS flips: the scooped tail stands the board almost vertical while it turns (slow-mo:
+      // ~70-80 deg up as it comes round the first 90), then it lays back down flat
+      const scoopEarly = Math.max(0, 1 - Math.min(1, ph) / 0.8);
+      const trickPitch = tr.scoop ? -1.05 * T.scoopStand * dir * easeInOut(scoopEarly) * held : -0.34 * T.popAngle * dir * easeInOut(early) * held;
+      if (Math.abs(trickPitch) > Math.abs(popPitch)) popPitch = trickPitch;
+      // the flicking toe drags the board a little sideways off the kick, then the catch squares it up
+      if (tr.flips && !tr.shove) flickYaw = 0.2 * Math.sign(tr.flipPer) * Math.sin(Math.PI * Math.min(1, ph)) * held;
+      // ...and the back-foot scoop gets the board round ahead of the hips; the body catches up to it
+      if (tr.scoop) flickYaw = tr.scoop * 0.75 * Math.sin(Math.PI * Math.min(1, ph * 0.9)) * held;
+    }
+    // yaw about the rider's up first, then the pitch about the board's own axis (so a scooped board
+    // turns while it stands up, instead of twisting sideways)
+    // board control (mouse / flick stick held in the air): yaw about the rider's up, then nose/tail down,
+    // applied outside the flip so it reads the same whichever way the board is rolling
+    const bp = this.boardPose;
+    if (this.mode === 'air' && (bp.p || bp.y)) {
+      const py = BOARD.pivotY;
+      local.multiply(t.makeTranslation(0, py, 0)).multiply(tmp.makeRotationY(bp.y)).multiply(tmp.makeRotationX(bp.p)).multiply(tmp.makeRotationZ(-bp.y * 0.12)).multiply(t.makeTranslation(0, -py, 0));
+    }
+    if (flickYaw) local.multiply(tmp.makeRotationY(flickYaw));
+    if (popPitch) {
+      // pivot on the tail (or nose for a nollie) like the board does as it leaves the ground
+      const pz = -dir * (BOARD.length / 2 - 0.06);
+      local.multiply(t.makeTranslation(0, 0, pz)).multiply(tmp.makeRotationX(popPitch)).multiply(t.makeTranslation(0, 0, -pz));
+    }
+    if (this.mode === 'ground' && this.wallie) {
+      // wallie: back wheels on the ground, front wheels rolled up the face
+      const w = this.wallie;
+      const k = w.lift * w.lift * (3 - 2 * w.lift);
+      const pz = -BOARD.truckAxleZ;
+      local.multiply(t.makeTranslation(0, 0, pz)).multiply(tmp.makeRotationX(-w.pitch * k)).multiply(t.makeTranslation(0, 0, -pz));
     }
     if (this.mode === 'ground' && this.manual) {
       const pz = this.manual > 0 ? -BOARD.truckAxleZ : BOARD.truckAxleZ;
-      const a = this.manual > 0 ? -0.2 : 0.2;
+      // balance point: eased stick = how high it's held, plus a little wobble around the balance point
+      const bal = 0.12 + 0.17 * this.manualTilt + 0.018 * Math.sin(this.time * 4.7) + 0.01 * Math.sin(this.time * 11.3);
+      const a = this.manual > 0 ? -bal : bal;
       local.multiply(t.makeTranslation(0, BOARD.wheelRadius, pz)).multiply(tmp.makeRotationX(a)).multiply(t.makeTranslation(0, -BOARD.wheelRadius, -pz));
     }
     if (this.mode === 'grind' && this.grind) {
@@ -1225,11 +1786,14 @@ export class SkaterController {
       const spec = GRINDS[g.type] || GRINDS['50-50'];
       const side = Math.sign(g.approach.dot(this.side(_v1))) || 1;
       const sway = Math.sin(this.time * 7.3) * 0.02 + Math.sin(this.time * 12.1) * 0.008;
+      // holding the mouse on the rail: sideways leans the board over it, up / back presses the nose / tail
+      const gu = this.poseActive ? this.poseIn.u : 0;
+      const gv = this.poseActive && !this.loading ? clamp(this.poseIn.v, -0.3, 0.3) : 0;
       local
         .multiply(t.makeTranslation(0, spec.h, spec.z))
         .multiply(tmp.makeRotationY((spec.yaw || 0) * side))
-        .multiply(tmp.makeRotationX(spec.pitch || 0))
-        .multiply(tmp.makeRotationZ((spec.roll || 0) * side + sway))
+        .multiply(tmp.makeRotationX((spec.pitch || 0) + gv * 0.3))
+        .multiply(tmp.makeRotationZ((spec.roll || 0) * side + sway - gu * 0.14))
         .multiply(t.makeTranslation(0, -spec.h, -spec.z));
     }
     if (this.mode === 'ground') {
@@ -1239,7 +1803,7 @@ export class SkaterController {
     const py = BOARD.pivotY;
     if (pitch || shove || flip || lift) {
       local
-        .multiply(t.makeTranslation(0, py + lift, 0))
+        .multiply(t.makeTranslation(driftX, py + lift, 0))
         .multiply(tmp.makeRotationX(pitch))
         .multiply(tmp.makeRotationY(shove))
         .multiply(tmp.makeRotationZ(flip))
@@ -1248,6 +1812,14 @@ export class SkaterController {
     if (imp) {
       // impossible: end over end, wrapped around the back foot
       local.multiply(t.makeTranslation(0, py, BOARD.backFootZ)).multiply(tmp.makeRotationX(imp)).multiply(t.makeTranslation(0, -py, -BOARD.backFootZ));
+    }
+    const at = this.airTw;
+    if (Math.abs(at.p) > 1e-4 || Math.abs(at.r) > 1e-4) {
+      local.multiply(t.makeTranslation(0, py, 0)).multiply(tmp.makeRotationX(at.p)).multiply(tmp.makeRotationZ(at.r)).multiply(t.makeTranslation(0, -py, 0));
+    }
+    const st = this.setTw;
+    if (this.mode === 'air' && (st.p || st.y || st.r)) {
+      local.multiply(t.makeTranslation(0, py, 0)).multiply(tmp.makeRotationY(st.y)).multiply(tmp.makeRotationX(st.p)).multiply(tmp.makeRotationZ(st.r)).multiply(t.makeTranslation(0, -py, 0));
     }
     if (this.grabTw.r || this.grabTw.p) {
       local.multiply(t.makeTranslation(0, py, 0)).multiply(tmp.makeRotationX(this.grabTw.p)).multiply(tmp.makeRotationZ(this.grabTw.r)).multiply(t.makeTranslation(0, -py, 0));

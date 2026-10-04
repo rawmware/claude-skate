@@ -9,9 +9,9 @@ export const GESTURES = [
   { name: 'Kickflip', seq: '↓ ↖', pts: ['c', 270, 135] },
   { name: 'Heelflip', seq: '↓ ↗', pts: ['c', 270, 45] },
   { name: 'Double Flip', seq: 'Flick fast', pts: ['c', 270, 135], badge: '×2', fast: true },
-  { name: 'BS Pop Shove-it', seq: '↓ ←', pts: ['c', 270, '~180'] },
-  { name: 'FS Pop Shove-it', seq: '↓ →', pts: ['c', 270, '~360'] },
-  { name: '360 Shove-it', seq: '↓ ← ↑', pts: ['c', 270, '~180', '~90'] },
+  { name: 'BS Pop Shuvit', seq: '↓ ←', pts: ['c', 270, '~180'] },
+  { name: 'FS Pop Shuvit', seq: '↓ →', pts: ['c', 270, '~360'] },
+  { name: '360 Shuvit', seq: '↓ ← ↑', pts: ['c', 270, '~180', '~90'] },
   { name: 'Varial Kickflip', seq: '↓ ← ↖', pts: ['c', 270, '~180', '~135'] },
   { name: 'Varial Heelflip', seq: '↓ → ↗', pts: ['c', 270, '~360', '~405'] },
   { name: 'Hardflip', seq: '↓ → ↖', pts: ['c', 270, '~360', 135] },
@@ -20,6 +20,19 @@ export const GESTURES = [
   { name: 'Laser Flip', seq: '↓ → ↑ ↖', pts: ['c', 270, '~360', '~450', '~495'] },
   { name: 'Late Flips', seq: 'Flick in the air', pts: ['c', 270, 135], badge: 'AIR', dashed: true },
   { name: 'Spins', seq: 'Hold A / D · left stick', spin: true },
+];
+
+// Grind wheel: hold the flick stick this way as you land on a rail (gamepad). Keyboard: see W / S / A / D in Controls.
+export const GRIND_GESTURES = [
+  { name: 'Nose Grind', seq: 'Hold ↑', pts: ['c', 90], hint: 'Lift the tail, grind on the front truck' },
+  { name: '5-0 Grind', seq: 'Hold ↓', pts: ['c', 270], hint: 'Lift the nose, grind on the back truck' },
+  { name: 'Crooked', seq: 'Hold ↖', pts: ['c', 135], hint: 'Front truck on the rail, tail angled up and away' },
+  { name: 'Overcrook', seq: 'Hold ↗', pts: ['c', 45], hint: 'Front truck over the rail, then crooked' },
+  { name: 'Willy', seq: 'Hold ↙', pts: ['c', 225], hint: 'Back truck on the rail, nose up and over' },
+  { name: 'Salad', seq: 'Hold ↘', pts: ['c', 315], hint: 'Back truck on the rail, nose angled over the rail' },
+  { name: 'Feeble', seq: 'Hold ←', pts: ['c', 180], hint: 'Back truck on the rail, nose under the far side' },
+  { name: 'Smith', seq: 'Hold →', pts: ['c', 0], hint: 'Back truck on the rail, nose under the rail' },
+  { name: 'Grind Exit', seq: 'Hold A / D · left stick', spin: true, hint: 'Hold briefly to roll off the rail either side' },
 ];
 
 const R = 31;

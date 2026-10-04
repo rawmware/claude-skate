@@ -24,10 +24,10 @@ export const TRICKS = {
   '-2,0': 'Double Heelflip',
   '3,0': 'Triple Kickflip',
   '-3,0': 'Triple Heelflip',
-  '0,1': 'Pop Shove-it',
-  '0,-1': 'FS Pop Shove-it',
-  '0,2': '360 Shove-it',
-  '0,-2': 'FS 360 Shove-it',
+  '0,1': 'Pop Shuvit',
+  '0,-1': 'FS Pop Shuvit',
+  '0,2': '360 Shuvit',
+  '0,-2': 'FS 360 Shuvit',
   '1,1': 'Varial Kickflip',
   '-1,-1': 'Varial Heelflip',
   '1,-1': 'Hardflip',
@@ -37,9 +37,9 @@ export const TRICKS = {
   '2,1': 'Double Varial Kickflip',
   '-2,-1': 'Double Varial Heelflip',
   '2,2': 'Double 360 Flip',
-  '0,3': '540 Shove-it',
-  '0,-3': 'FS 540 Shove-it',
-  '0,4': '720 Shove-it',
+  '0,3': '540 Shuvit',
+  '0,-3': 'FS 540 Shuvit',
+  '0,4': '720 Shuvit',
   '2,4': 'Double 360 Flip',
   '-2,-4': 'Double Laser Flip',
   '2,-2': 'Double Hardflip',
@@ -52,7 +52,7 @@ export function trickName(flips, shove, nollie, fakie, imp = 0) {
   let base = imp ? (Math.abs(imp) > 1 ? `${Math.abs(imp) === 2 ? 'Double' : Math.abs(imp) + 'x'} Impossible` : 'Impossible') : TRICKS[`${flips},${shove}`];
   if (!base) {
     const parts = [];
-    if (shove) parts.push(`${Math.abs(shove) * 180} ${shove > 0 ? 'BS' : 'FS'} Shove`);
+    if (shove) parts.push(`${Math.abs(shove) * 180} ${shove > 0 ? 'BS' : 'FS'} Shuvit`);
     if (flips) parts.push(`${Math.abs(flips) > 1 ? Math.abs(flips) + 'x ' : ''}${flips > 0 ? 'Kickflip' : 'Heelflip'}`);
     base = parts.join(' ') || 'Ollie';
   }
@@ -179,6 +179,10 @@ export class FlickRecognizer {
         this.lastSweep = this.sweep;
         const settling = rimSpeed < 5 || this.pendingT > 0.16;
         if (mag < 0.4) return this._pop(this.lastLU, this.lastLV);
+        // half-circle at the top: a 360 shuvit ends here, but a 360 flip / laser keeps going past the top,
+        // so give the stick a moment to carry on before deciding
+        const aS = Math.abs(this.sweep);
+        if (aS > 2.3 && aS < 3.6 && this.pendingT < 0.14) return null;
         if (this.pendingT >= 0.04 && settling) return this._pop(lu, lv);
         return null;
       }
@@ -278,7 +282,9 @@ export class FlickRecognizer {
     const speedFactor = Math.max(0, Math.min(1, 1 - (flickTime - 0.05) / 0.3));
     const power = Math.max(0.25, Math.min(1, 0.35 + 0.45 * speedFactor + 0.25 * this.loadedAmount));
     this.state = 'cooldown';
-    return { type: 'pop', nose: this.nose, flips, shove, imp, power, late: false };
+    // flick speed drives how fast the board flips (separate from pop height), like Skate 3's flick-speed mod
+    const flickSpeed = Math.pow(speedFactor, 1.3);
+    return { type: 'pop', nose: this.nose, flips, shove, imp, power, flickSpeed, late: false };
   }
 
   _lateFlick(u, v) {
@@ -289,6 +295,6 @@ export class FlickRecognizer {
     if (a > 2.4) shove = ang > 0 ? 1 : -1; // flicked down-ish
     else if (ang > 0) flips = 1;
     else flips = -1;
-    return { type: 'pop', nose: false, flips, shove, power: 0, late: true };
+    return { type: 'pop', nose: false, flips, shove, power: 0, flickSpeed: 0.6, late: true };
   }
 }

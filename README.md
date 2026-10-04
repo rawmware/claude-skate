@@ -33,6 +33,7 @@ other standard-mapping pad) and press a button.
 | **A / D** | Carve; on the ground, wind up for a spin; in the air, spin |
 | **Space** | Simple ollie (hold, then release); tap in the air to catch |
 | **Q / E** | Manual / nose manual (hold) |
+| **Pop with your front wheels against a curb, ledge, bench or wall** | Wallie: the board noses up the face, then pops up and over onto it |
 | **Right click** in the air | Grab (add **D** for heel side, **W**/**S** for nose/tail). Let go before landing |
 | **W / S** while locking onto a rail | Nose grinds and slides / 5-0s and tailslides. Press a new one mid-grind to switch |
 | **S + A/D** at a rail | Smith or feeble grind (sideways: bluntslide). While W or S is held in the air, A/D picks the variation instead of spinning |

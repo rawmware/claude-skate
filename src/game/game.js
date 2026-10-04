@@ -7,6 +7,12 @@ import { CameraRig } from './camera.js';
 import { Input } from './input.js';
 import { Dropper } from './dropper.js';
 import { Sparks } from './sparks.js';
+import { T } from '../core/tuning.js';
+import { createModMenu } from '../ui/modmenu.js';
+
+const _sX = new THREE.Vector3(), _sY = new THREE.Vector3(), _sZ = new THREE.Vector3(), _sP = new THREE.Vector3();
+const _sM = new THREE.Matrix4(), _sQ = new THREE.Quaternion(), _sQ2 = new THREE.Quaternion();
+const _rP = new THREE.Vector3(), _rQ = new THREE.Quaternion(), _rS = new THREE.Vector3();
 
 const MAX_STEP = 1 / 120;
 
@@ -22,6 +28,7 @@ const DEFAULT_SETTINGS = {
   quality: 'high',
   showTrickNames: true,
   gestureGuide: true,
+  flickSide: 'right',
 };
 
 const store = {
@@ -131,6 +138,7 @@ export class Game {
     this.input = new Input(canvas);
     this.input.mouseSensitivity = this.settings.mouseSensitivity;
     this.input.invertFlickY = this.settings.invertFlickY;
+    this.input.flickSide = this.settings.flickSide;
     this.dropper = new Dropper(this.world, this.collision, this.scene);
     this.sparks = new Sparks(this.scene);
 
@@ -139,6 +147,7 @@ export class Game {
 
     // ---- UI ----
     this.previewYaw = 0;
+    this.showcase = 0; // 0 = board on the ground, 1 = floating upright for the customize view
     this.ui = createUI({
       root: uiRoot,
       appearance: this.appearance,
@@ -164,12 +173,13 @@ export class Game {
 
     window.addEventListener('resize', () => this._resize());
     this._resize();
+    this.modMenu = createModMenu(this); // M / Insert: live physics + trick tuning
     document.addEventListener('pointerlockchange', () => {
-      if (!this.input.pointerLocked && this.mode === 'playing' && this.hadPointerLock && !this.dropper.active) this.pause();
+      if (!this.input.pointerLocked && this.mode === 'playing' && this.hadPointerLock && !this.dropper.active && !this.modMenu.open) this.pause();
       this.hadPointerLock = this.input.pointerLocked;
     });
     canvas.addEventListener('click', () => {
-      if (this.mode === 'playing' && !this.input.pointerLocked) this.input.requestPointerLock();
+      if (this.mode === 'playing' && !this.input.pointerLocked && !this.modMenu.open) this.input.requestPointerLock();
     });
     document.addEventListener('visibilitychange', () => {
       if (document.hidden && this.mode === 'playing') this.pause();
@@ -219,6 +229,7 @@ export class Game {
       store.set('settings', this.settings);
       this.input.mouseSensitivity = this.settings.mouseSensitivity;
       this.input.invertFlickY = this.settings.invertFlickY;
+    this.input.flickSide = this.settings.flickSide;
       this.controller.stance = this.settings.stance;
       this.camera.fov = this.settings.cameraFov;
       this.camera.updateProjectionMatrix();
@@ -282,7 +293,8 @@ export class Game {
     if (!this.introShown) {
       this.introShown = true;
       this.hintTimer = 9;
-      this.ui.setControlsHint?.('W push · A/D carve · hold left click, pull back & flick, release to pop · click to catch · land on rails to grind (hold S/W ± A/D for variations) · Esc menu');
+      this.ui.setControlsHint?.('W push · A/D carve · hold left click: pull back + flick to pop, KEEP HOLDING to steer the board (up = nose down, back = tail down, sideways = turn it) · on the ground ease the mouse halfway back / forward = manual / nose manual · land on a rail with the board angled to pick the grind · Esc menu');
+      this.hintTimer = 14;
     }
   }
 
@@ -313,6 +325,7 @@ export class Game {
   }
 
   openDropper() {
+    if (!this.world.catalog?.length) return this.ui.toast?.('No object dropper on this map');
     if (this.controller.mode === 'bail') this.controller.respawn();
     this.mode = 'dropper';
     this.ui.show('dropper');
@@ -342,7 +355,7 @@ export class Game {
   }
 
   frame() {
-    const dt = Math.min(this.clock.getDelta(), 1 / 20);
+    const dt = Math.min(this.clock.getDelta(), 1 / 20) * T.timeScale; // mod menu slow-mo
     this.time += dt;
     this._fps = this._fps ? this._fps * 0.95 + (1 / Math.max(dt, 1e-3)) * 0.05 : 60;
     const inp = this.input.poll(dt);
@@ -378,7 +391,7 @@ export class Game {
         // close-up turntable of the skater
         const c = this.controller.pos;
         const yaw = this.rig.heading + Math.PI + this.previewYaw;
-        const [dist, hgt, look] = this.skater ? [3.0, 1.15, 0.95] : [1.25, 0.55, 0.08];
+        const [dist, hgt, look] = this.skater ? [3.0, 1.15, 0.95] : [1.6, 0.62, 0.56];
         _v.set(c.x + Math.sin(yaw) * dist, c.y + hgt, c.z + Math.cos(yaw) * dist);
         this.camera.position.lerp(_v, 1 - Math.exp(-6 * dt));
         _v2.set(c.x, c.y + look, c.z);
@@ -412,7 +425,28 @@ export class Game {
       if (sk.isRagdoll) sk.updateRagdoll(dt);
       else sk.update(dt, c.getPose(this.pose));
     }
-    this.board.object3d.matrix.copy(c.boardMatrix(this.board.object3d.matrix));
+    const bm = this.board.object3d.matrix;
+    c.boardMatrix(bm);
+    // customize: lift the board up and stand it on its tail, grip facing the camera, so the whole
+    // thing is on show (orbit with the preview rotate to see the graphic side)
+    const want = this.mode === 'customize' && !this.skater ? 1 : 0;
+    this.showcase += (want - this.showcase) * (1 - Math.exp(-5 * dt));
+    if (this.showcase < 1e-3) this.showcase = 0;
+    if (this.showcase) {
+      const k = this.showcase * this.showcase * (3 - 2 * this.showcase);
+      const t = c.time;
+      const yaw0 = this.rig.heading + Math.PI;
+      _sY.set(Math.sin(yaw0), 0, Math.cos(yaw0)); // grip faces the camera
+      _sZ.set(0, 1, 0); // nose up
+      _sX.crossVectors(_sY, _sZ);
+      _sM.makeBasis(_sX, _sY, _sZ);
+      _sQ.setFromRotationMatrix(_sM).premultiply(_sQ2.setFromAxisAngle(_sZ, 0.12 * Math.sin(t * 0.7)));
+      _sP.copy(c.pos).y += 0.56 + 0.025 * Math.sin(t * 1.6);
+      bm.decompose(_rP, _rQ, _rS);
+      _rP.lerp(_sP, k);
+      _rQ.slerp(_sQ, k);
+      bm.compose(_rP, _rQ, _rS.set(1, 1, 1));
+    }
     this.board.object3d.matrixWorldNeedsUpdate = true;
     this.board.setWheelSpin(c.wheelSpin);
     this.board.setTruckLean(c.lean);
@@ -509,6 +543,7 @@ export class Game {
     for (const e of events) {
       switch (e.type) {
         case 'pop':
+          this.input.recenterFlick?.();
           a.play('pop', 0.6 + 0.4 * (e.power ?? 1));
           this.input.rumble(0.35, 60);
           break;

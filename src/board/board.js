@@ -1,10 +1,12 @@
 import * as THREE from 'three';
 import { BOARD } from '../core/constants.js';
 import { TRUCK_FINISHES, DEFAULT_BOARD } from '../core/customization.js';
+import { loadBoardModel } from './model.js';
 
 // Procedural skateboard: concave deck with kicked nose/tail, 7-ply edge, grip tape, trucks, wheels.
 // Board-local frame per constants.js: origin at the wheel contact center, +Z nose, +Y up.
 
+const GRIP_INSET = 0.0016; // grip tape is trimmed a hair inside the deck outline
 const L = BOARD.length;
 const W = BOARD.width;
 const T = BOARD.deckThickness;
@@ -32,8 +34,9 @@ function deckHalfWidth(z) {
 function concave(x, z) {
   const hw = deckHalfWidth(z);
   const u = hw > 0 ? x / (W / 2) : 0;
-  const along = 1 - Math.min(1, Math.max(0, (Math.abs(z) - BOARD.kickStartZ) / 0.1)) * 0.6;
-  return 0.0055 * u * u * along;
+  const along = 1 - Math.min(1, Math.max(0, (Math.abs(z) - BOARD.kickStartZ) / 0.1)) * 0.55;
+  const au = Math.abs(u);
+  return 0.0098 * (0.55 * au * au + 0.45 * Math.pow(au, 3.2)) * along;
 }
 
 function buildDeckGeometry() {
@@ -41,6 +44,7 @@ function buildDeckGeometry() {
   const NX = 14;
   const base = BOARD.deckBottomY;
   const top = [];
+  const topGrip = [];
   const bottom = [];
   const uvT = [];
   const uvB = [];
@@ -48,11 +52,16 @@ function buildDeckGeometry() {
     const z = -L / 2 + (L * i) / NZ;
     const hw = Math.max(0.004, deckHalfWidth(z));
     const yz = deckProfileY(z);
+    const gripInset = Math.min(GRIP_INSET, hw * 0.5);
     for (let j = 0; j <= NX; j++) {
       const x = -hw + (2 * hw * j) / NX;
       const c = concave(x, z);
-      top.push(x, base + T + yz + c, z);
+      // rounded top edge: the veneer rolls over the rail slightly
+      const edge = Math.abs(x) / hw;
+      const roll = edge > 0.94 ? ((edge - 0.94) / 0.06) ** 2 * 0.0016 : 0;
+      top.push(x, base + T + yz + c - roll, z);
       bottom.push(x, base + yz + c, z);
+      topGrip.push(Math.sign(x) * Math.max(0, Math.abs(x) - gripInset), base + T + yz + c + 0.0009 - Math.max(0, edge - 0.9) * 0.002, Math.sign(z) * Math.max(0, Math.abs(z) - (i === 0 || i === NZ ? GRIP_INSET : 0)));
       uvT.push(0.5 + x / W, i / NZ);
       uvB.push(0.5 - x / W, i / NZ);
     }
@@ -61,16 +70,21 @@ function buildDeckGeometry() {
 
   // top (grip)
   const gTop = new THREE.BufferGeometry();
-  gTop.setAttribute('position', new THREE.Float32BufferAttribute(top, 3));
+  gTop.setAttribute('position', new THREE.Float32BufferAttribute(topGrip, 3));
   gTop.setAttribute('uv', new THREE.Float32BufferAttribute(uvT, 2));
   const iTop = [];
   for (let i = 0; i < NZ; i++)
     for (let j = 0; j < NX; j++) {
       const a = idx(i, j), b = idx(i + 1, j), c = idx(i + 1, j + 1), d = idx(i, j + 1);
-      iTop.push(a, d, b, b, d, c);
+      iTop.push(a, b, d, b, c, d);
     }
   gTop.setIndex(iTop);
   gTop.computeVertexNormals();
+  const gWood = new THREE.BufferGeometry();
+  gWood.setAttribute('position', new THREE.Float32BufferAttribute(top, 3));
+  gWood.setAttribute('uv', new THREE.Float32BufferAttribute(uvT, 2));
+  gWood.setIndex(iTop);
+  gWood.computeVertexNormals();
 
   // bottom (graphic)
   const gBot = new THREE.BufferGeometry();
@@ -80,7 +94,7 @@ function buildDeckGeometry() {
   for (let i = 0; i < NZ; i++)
     for (let j = 0; j < NX; j++) {
       const a = idx(i, j), b = idx(i + 1, j), c = idx(i + 1, j + 1), d = idx(i, j + 1);
-      iBot.push(a, b, d, b, c, d);
+      iBot.push(a, d, b, b, d, c);
     }
   gBot.setIndex(iBot);
   gBot.computeVertexNormals();
@@ -115,7 +129,36 @@ function buildDeckGeometry() {
   }
   gEdge.setIndex(ie);
   gEdge.computeVertexNormals();
-  return { gTop, gBot, gEdge };
+  return { gTop, gBot, gEdge, gWood };
+}
+
+// Original abstract emblem (no text, no brand): a ring crossed by three bars around a diamond core.
+// Drawn centered on the origin; size ~ its height in px.
+function drawEmblem(ctx, size, fill, stroke) {
+  const r = size * 0.5;
+  const shape = () => {
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.arc(0, 0, r * 0.68, 0, Math.PI * 2, true);
+    for (const y of [-0.42, 0, 0.42]) ctx.rect(-r * 1.55, y * r - r * 0.09, r * 3.1, r * 0.18);
+    ctx.moveTo(0, -r * 0.42);
+    ctx.lineTo(r * 0.36, 0);
+    ctx.lineTo(0, r * 0.42);
+    ctx.lineTo(-r * 0.36, 0);
+    ctx.closePath();
+  };
+  ctx.save();
+  ctx.lineJoin = 'round';
+  if (stroke) {
+    ctx.lineWidth = size * 0.07;
+    ctx.strokeStyle = stroke;
+    shape();
+    ctx.stroke();
+  }
+  ctx.fillStyle = fill;
+  shape();
+  ctx.fill();
+  ctx.restore();
 }
 
 function noiseCanvas(w, h, base, spread, grain = 1) {
@@ -138,7 +181,7 @@ function noiseCanvas(w, h, base, spread, grain = 1) {
 let gripNormalTex = null;
 function getGripNormal() {
   if (gripNormalTex) return gripNormalTex;
-  const s = 256;
+  const s = 512;
   const c = document.createElement('canvas');
   c.width = c.height = s;
   const ctx = c.getContext('2d');
@@ -152,14 +195,24 @@ function getGripNormal() {
   ctx.putImageData(img, 0, 0);
   gripNormalTex = new THREE.CanvasTexture(c);
   gripNormalTex.wrapS = gripNormalTex.wrapT = THREE.RepeatWrapping;
-  gripNormalTex.repeat.set(2, 8);
+  gripNormalTex.repeat.set(3, 12);
   return gripNormalTex;
 }
 
 function makeGripTexture(cfg) {
   const w = 256, h = 1024;
   const base = cfg.grip === 'clear' ? [0, 0, 0] : [22, 22, 24];
-  const { c, ctx } = noiseCanvas(w, h, base, 40);
+  const { c, ctx } = noiseCanvas(w, h, base, 64);
+  if (cfg.grip !== 'clear') {
+    const gi = ctx.getImageData(0, 0, w, h);
+    for (let i = 0; i < w * h; i++) {
+      if (Math.random() < 0.035) {
+        const v = 70 + Math.random() * 70;
+        gi.data[i * 4] = gi.data[i * 4 + 1] = gi.data[i * 4 + 2] = v;
+      }
+    }
+    ctx.putImageData(gi, 0, 0);
+  }
   if (cfg.grip === 'clear') {
     // see-through grip: show the deck color with a dark speckle
     ctx.globalCompositeOperation = 'destination-over';
@@ -192,11 +245,7 @@ function makeGripTexture(cfg) {
     ctx.save();
     ctx.translate(w / 2, h * 0.5);
     ctx.rotate(-Math.PI / 2);
-    ctx.font = '900 120px Impact, "Arial Black", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = cfg.deckColor;
-    ctx.fillText('SK8.IO', 0, 0);
+    drawEmblem(ctx, 120, cfg.deckColor, null);
     ctx.restore();
   }
   // wear near the bolts & tail
@@ -339,14 +388,7 @@ function makeGraphicTexture(cfg) {
     ctx.save();
     ctx.translate(w / 2, h / 2);
     ctx.rotate(-Math.PI / 2);
-    ctx.font = '900 150px Impact, "Arial Black", sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.lineWidth = 10;
-    ctx.strokeStyle = g === 'logo' ? '#111' : col;
-    ctx.strokeText('SK8.IO', 0, 0);
-    ctx.fillStyle = g === 'logo' ? acc : (g === 'plain' ? 'rgba(255,255,255,0.15)' : '#fff');
-    ctx.fillText('SK8.IO', 0, 0);
+    drawEmblem(ctx, g === 'logo' ? 150 : 110, g === 'logo' ? acc : g === 'plain' ? 'rgba(255,255,255,0.15)' : '#fff', g === 'logo' ? '#111' : col);
     ctx.restore();
   }
   // scratches & wear on the bottom (boards get beat up)
@@ -369,56 +411,116 @@ function makeGraphicTexture(cfg) {
 let plyTex = null;
 function getPlyTexture() {
   if (plyTex) return plyTex;
+  // 7-ply maple seen from the edge: pale plies with alternating grain direction, thin glue lines, a dyed veneer
+  const w = 256, h = 64;
   const c = document.createElement('canvas');
-  c.width = 64;
-  c.height = 32;
+  c.width = w;
+  c.height = h;
   const ctx = c.getContext('2d');
-  const plies = ['#d8b27a', '#c99d63', '#7a3b2a', '#d6ae75', '#2f4f7a', '#cfa66c', '#d8b27a'];
+  const plies = ['#c9a06a', '#e2c28f', '#d9b67f', '#e6c995', '#d9b67f', '#e2c28f', '#c9a06a'];
+  const ph = h / plies.length;
   plies.forEach((p, i) => {
     ctx.fillStyle = p;
-    ctx.fillRect(0, (i * 32) / plies.length, 64, 32 / plies.length + 1);
+    ctx.fillRect(0, i * ph, w, ph + 1);
+    // grain flecks
+    for (let k = 0; k < 90; k++) {
+      ctx.fillStyle = `rgba(110,70,30,${0.05 + Math.random() * 0.12})`;
+      ctx.fillRect(Math.random() * w, i * ph + Math.random() * ph, 6 + Math.random() * 26, 0.6);
+    }
+    // glue line
+    ctx.fillStyle = 'rgba(60,35,15,0.55)';
+    ctx.fillRect(0, i * ph, w, 0.9);
   });
   plyTex = new THREE.CanvasTexture(c);
   plyTex.colorSpace = THREE.SRGBColorSpace;
   plyTex.wrapS = THREE.RepeatWrapping;
+  plyTex.anisotropy = 8;
   return plyTex;
+}
+
+// mounting hardware under the deck: eight bolt nuts, plus the pivot-side nylon lock nuts
+function buildHardware(darkMat, metalMat) {
+  const out = [];
+  const nutGeo = new THREE.CylinderGeometry(0.0055, 0.0055, 0.0045, 6);
+  for (const side of [1, -1]) {
+    for (const dz of [-0.0285, 0.0285]) {
+      for (const dx of [-0.0205, 0.0205]) {
+        const n = new THREE.Mesh(nutGeo, darkMat);
+        n.position.set(dx, BOARD.deckBottomY - 0.0105, side * BOARD.truckAxleZ + dz);
+        out.push(n);
+      }
+    }
+  }
+  return out;
 }
 
 function buildTruck(metalMat, darkMat, bushingMat) {
   const truck = new THREE.Group();
-  // baseplate
-  const base = new THREE.Mesh(new THREE.BoxGeometry(0.056, 0.008, 0.07), metalMat);
-  base.position.y = BOARD.deckBottomY - 0.004;
-  truck.add(base);
+  const bY = BOARD.deckBottomY;
+  // baseplate: tapered plate with a pivot-cup boss
+  const bp = new THREE.Shape();
+  bp.moveTo(-0.029, -0.036);
+  bp.lineTo(0.029, -0.036);
+  bp.lineTo(0.026, 0.036);
+  bp.lineTo(-0.026, 0.036);
+  bp.closePath();
+  const bpg = new THREE.ExtrudeGeometry(bp, { depth: 0.007, bevelEnabled: true, bevelThickness: 0.0012, bevelSize: 0.0016, bevelSegments: 2 });
+  bpg.rotateX(Math.PI / 2);
+  bpg.translate(0, bY, 0);
+  truck.add(new THREE.Mesh(bpg, metalMat));
   // riser pad
-  const riser = new THREE.Mesh(new THREE.BoxGeometry(0.058, 0.003, 0.072), darkMat);
-  riser.position.y = BOARD.deckBottomY - 0.0015;
+  const riser = new THREE.Mesh(new THREE.BoxGeometry(0.058, 0.003, 0.074), darkMat);
+  riser.position.y = bY - 0.0015;
   truck.add(riser);
-  // kingpin + bushings
-  const kp = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.05, 8), darkMat);
-  kp.position.set(0, BOARD.deckBottomY - 0.025, 0.012);
+  // pivot cup + kingpin boss
+  const boss = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.013, 0.012, 14), metalMat);
+  boss.position.set(0, bY - 0.012, -0.014);
+  boss.rotation.x = -0.25;
+  truck.add(boss);
+  // kingpin, washers, bushings and the lock nut
+  const kp = new THREE.Mesh(new THREE.CylinderGeometry(0.0045, 0.0045, 0.058, 10), darkMat);
+  kp.position.set(0, bY - 0.028, 0.016);
   kp.rotation.x = 0.55;
   truck.add(kp);
-  const bush = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.012, 0.016, 14), bushingMat);
-  bush.position.set(0, BOARD.deckBottomY - 0.022, 0.015);
-  bush.rotation.x = 0.55;
-  truck.add(bush);
+  for (const [dy, r, col] of [[-0.016, 0.0125, bushingMat], [-0.031, 0.0115, bushingMat]]) {
+    const bush = new THREE.Mesh(new THREE.CylinderGeometry(r * 0.92, r, 0.0125, 16), col);
+    bush.position.set(0, bY + dy, 0.016 + dy * -0.55);
+    bush.rotation.x = 0.55;
+    truck.add(bush);
+  }
+  const washer = new THREE.Mesh(new THREE.CylinderGeometry(0.013, 0.013, 0.0022, 16), metalMat);
+  washer.position.set(0, bY - 0.0385, 0.0275);
+  washer.rotation.x = 0.55;
+  truck.add(washer);
+  const lock = new THREE.Mesh(new THREE.CylinderGeometry(0.0085, 0.0085, 0.009, 6), darkMat);
+  lock.position.set(0, bY - 0.0445, 0.0315);
+  lock.rotation.x = 0.55;
+  truck.add(lock);
   // hanger: pivot group (leans around the kingpin axis)
   const hanger = new THREE.Group();
   hanger.position.set(0, BOARD.wheelRadius, 0);
   const shape = new THREE.Shape();
-  shape.moveTo(-0.06, 0.0);
-  shape.lineTo(0.06, 0.0);
-  shape.lineTo(0.035, 0.03);
-  shape.quadraticCurveTo(0, 0.045, -0.035, 0.03);
-  shape.lineTo(-0.06, 0.0);
-  const hg = new THREE.ExtrudeGeometry(shape, { depth: 0.022, bevelEnabled: true, bevelThickness: 0.004, bevelSize: 0.004, bevelSegments: 2 });
-  hg.translate(0, -0.006, -0.011);
-  const hangerMesh = new THREE.Mesh(hg, metalMat);
-  hanger.add(hangerMesh);
-  const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.25, 8), darkMat);
+  shape.moveTo(-0.058, -0.004);
+  shape.lineTo(0.058, -0.004);
+  shape.lineTo(0.052, 0.008);
+  shape.lineTo(0.04, 0.026);
+  shape.quadraticCurveTo(0.02, 0.043, 0, 0.044);
+  shape.quadraticCurveTo(-0.02, 0.043, -0.04, 0.026);
+  shape.lineTo(-0.052, 0.008);
+  shape.closePath();
+  const hg = new THREE.ExtrudeGeometry(shape, { depth: 0.022, bevelEnabled: true, bevelThickness: 0.0035, bevelSize: 0.0035, bevelSegments: 3 });
+  hg.translate(0, 0, -0.011);
+  hanger.add(new THREE.Mesh(hg, metalMat));
+  const axle = new THREE.Mesh(new THREE.CylinderGeometry(0.0045, 0.0045, 0.255, 10), darkMat);
   axle.rotation.z = Math.PI / 2;
   hanger.add(axle);
+  // axle nuts
+  for (const sx of [1, -1]) {
+    const nut = new THREE.Mesh(new THREE.CylinderGeometry(0.0072, 0.0072, 0.007, 6), darkMat);
+    nut.rotation.z = Math.PI / 2;
+    nut.position.x = sx * (BOARD.axleHalfTrack + BOARD.wheelWidth / 2 + 0.0045);
+    hanger.add(nut);
+  }
   truck.add(hanger);
   truck.userData.hanger = hanger;
   return truck;
@@ -428,24 +530,37 @@ function buildWheel(wheelMat, coreMat, radius) {
   const r = radius;
   const hw = BOARD.wheelWidth / 2;
   const pts = [];
-  pts.push(new THREE.Vector2(0.011, -hw));
-  pts.push(new THREE.Vector2(r - 0.008, -hw));
-  for (let i = 0; i <= 8; i++) {
-    const a = -Math.PI / 2 + (i / 8) * Math.PI;
-    pts.push(new THREE.Vector2(r - 0.006 + Math.cos(a) * 0.006, Math.sin(a) * hw * 0.98));
+  pts.push(new THREE.Vector2(0.0125, -hw));
+  pts.push(new THREE.Vector2(0.0125, -hw * 0.93));
+  pts.push(new THREE.Vector2(r * 0.42, -hw * 0.93)); // recessed hub face
+  pts.push(new THREE.Vector2(r * 0.46, -hw));
+  pts.push(new THREE.Vector2(r - 0.01, -hw));
+  for (let i = 0; i <= 10; i++) {
+    const a = -Math.PI / 2 + (i / 10) * Math.PI;
+    pts.push(new THREE.Vector2(r - 0.007 + Math.cos(a) * 0.007, Math.sin(a) * hw * 0.98));
   }
-  pts.push(new THREE.Vector2(r - 0.008, hw));
-  pts.push(new THREE.Vector2(0.011, hw));
-  const g = new THREE.LatheGeometry(pts, 28);
+  pts.push(new THREE.Vector2(r - 0.01, hw));
+  pts.push(new THREE.Vector2(r * 0.46, hw));
+  pts.push(new THREE.Vector2(r * 0.42, hw * 0.93));
+  pts.push(new THREE.Vector2(0.0125, hw * 0.93));
+  pts.push(new THREE.Vector2(0.0125, hw));
+  const g = new THREE.LatheGeometry(pts, 36);
   g.rotateZ(Math.PI / 2); // axis -> X
   const wheel = new THREE.Group();
   wheel.add(new THREE.Mesh(g, wheelMat));
-  const core = new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.011, BOARD.wheelWidth * 1.02, 14), coreMat);
-  core.rotation.z = Math.PI / 2;
-  wheel.add(core);
-  // a tiny print band so the spin is visible
+  // bearing (steel ring + shield)
+  const brg = new THREE.Mesh(new THREE.CylinderGeometry(0.0115, 0.0115, BOARD.wheelWidth * 0.99, 18), coreMat);
+  brg.rotation.z = Math.PI / 2;
+  wheel.add(brg);
+  // printed ring on both faces so the spin reads
+  for (const sx of [1, -1]) {
+    const ring = new THREE.Mesh(new THREE.RingGeometry(r * 0.5, r * 0.58, 36), coreMat);
+    ring.rotation.y = sx * Math.PI / 2;
+    ring.position.x = sx * (hw * 0.935);
+    wheel.add(ring);
+  }
   const band = new THREE.Mesh(new THREE.BoxGeometry(BOARD.wheelWidth * 1.01, 0.004, 0.012), coreMat);
-  band.position.y = r * 0.62;
+  band.position.y = r * 0.74;
   wheel.add(band);
   return wheel;
 }
@@ -453,19 +568,21 @@ function buildWheel(wheelMat, coreMat, radius) {
 export function createBoard(initial = DEFAULT_BOARD) {
   const object3d = new THREE.Group();
   object3d.name = 'skateboard';
-  const { gTop, gBot, gEdge } = buildDeckGeometry();
+  const { gTop, gBot, gEdge, gWood } = buildDeckGeometry();
 
-  const gripMat = new THREE.MeshStandardMaterial({ roughness: 0.97, metalness: 0, normalMap: getGripNormal(), normalScale: new THREE.Vector2(0.6, 0.6) });
+  const gripMat = new THREE.MeshStandardMaterial({ roughness: 0.97, metalness: 0, normalMap: getGripNormal(), normalScale: new THREE.Vector2(1.1, 1.1) });
   const graphicMat = new THREE.MeshStandardMaterial({ roughness: 0.45, metalness: 0.0 });
-  const edgeMat = new THREE.MeshStandardMaterial({ map: getPlyTexture(), roughness: 0.7 });
+  const edgeMat = new THREE.MeshStandardMaterial({ map: getPlyTexture(), roughness: 0.7, side: THREE.DoubleSide });
   const metalMat = new THREE.MeshStandardMaterial({ color: '#b8bcc2', roughness: 0.35, metalness: 0.9 });
   const darkMat = new THREE.MeshStandardMaterial({ color: '#2b2b2b', roughness: 0.4, metalness: 0.8 });
   const bushingMat = new THREE.MeshStandardMaterial({ color: '#e0c33a', roughness: 0.7 });
   const wheelMat = new THREE.MeshPhysicalMaterial({ color: '#f4f1e6', roughness: 0.55, clearcoat: 0.2, clearcoatRoughness: 0.6 });
   const coreMat = new THREE.MeshStandardMaterial({ color: '#2e2e30', roughness: 0.5, metalness: 0.3 });
+  const bearingMat = new THREE.MeshStandardMaterial({ color: '#a7adb5', roughness: 0.3, metalness: 0.95 });
 
   const deck = new THREE.Group();
-  deck.add(new THREE.Mesh(gTop, gripMat), new THREE.Mesh(gBot, graphicMat), new THREE.Mesh(gEdge, edgeMat));
+  deck.add(new THREE.Mesh(gTop, gripMat), new THREE.Mesh(gWood, edgeMat), new THREE.Mesh(gBot, graphicMat), new THREE.Mesh(gEdge, edgeMat));
+  deck.add(...buildHardware(darkMat, metalMat));
   object3d.add(deck);
 
   const trucks = [];
@@ -511,6 +628,7 @@ export function createBoard(initial = DEFAULT_BOARD) {
     metalMat.color.set(tf.color);
     wheelMat.color.set(cfg.wheelColor);
     if (!wheels.length || ((cfg.wheelSize || 54) / 2000) !== wheelRadius) rebuildRunningGear(cfg);
+    model?.setWheelRadius(wheelRadius);
     object3d.traverse((o) => {
       if (o.isMesh) {
         o.castShadow = true;
@@ -519,16 +637,48 @@ export function createBoard(initial = DEFAULT_BOARD) {
     });
   }
 
+  let spin = 0;
+  let lean = 0;
   function setWheelSpin(rad) {
+    spin = rad;
     for (const w of wheels) w.rotation.x = rad;
+    model?.setWheelSpin(rad);
   }
 
-  function setTruckLean(lean) {
+  function setTruckLean(l) {
+    lean = l;
     // hangers roll opposite on front/back so the board carves
     for (let i = 0; i < trucks.length; i++) {
-      trucks[i].userData.hanger.rotation.z = lean * 0.12 * (i === 0 ? 1 : -1);
+      trucks[i].userData.hanger.rotation.z = l * 0.12 * (i === 0 ? 1 : -1);
     }
+    model?.setTruckLean(l);
   }
+
+  // The user's modeled board (src/board/deck.glb) replaces the procedural one once it has loaded; the procedural
+  // board stays as the placeholder while it streams in and as the fallback if it fails. Both share the materials
+  // above, so customization (grip/graphic textures, truck finish, wheel color/size) drives whichever is showing.
+  let model = null;
+  loadBoardModel({
+    grip: gripMat,
+    graphic: graphicMat,
+    edge: edgeMat,
+    metal: metalMat,
+    dark: darkMat,
+    bushing: bushingMat,
+    wheel: wheelMat,
+    core: coreMat,
+    bearing: bearingMat,
+  })
+    .then((m) => {
+      model = m;
+      m.setWheelRadius(wheelRadius);
+      m.setWheelSpin(spin);
+      m.setTruckLean(lean);
+      deck.visible = false;
+      truckRoot.visible = false;
+      object3d.add(m.object3d);
+    })
+    .catch((err) => console.warn('[board] modeled board failed to load, keeping the procedural one', err));
 
   setConfig(initial);
   return { object3d, setConfig, setWheelSpin, setTruckLean, get wheelRadius() { return wheelRadius; } };

@@ -13,6 +13,8 @@ const _a = new THREE.Vector3();
 const _b = new THREE.Vector3();
 const _c = new THREE.Vector3();
 const _target = { point: new THREE.Vector3(), distance: 0, faceIndex: 0 };
+const _bc = new THREE.Vector3();
+const _fn = new THREE.Vector3();
 
 function bakeMeshes(meshes) {
   // returns { geometry (world space, position only), surfaces: string[] per triangle }
@@ -36,14 +38,70 @@ function bakeMeshes(meshes) {
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-  return { geometry, surfaces };
+  return { geometry, surfaces, smooth: smoothCornerNormals(positions) };
+}
+
+// Per-corner smoothed normals: every triangle corner averages the (area-weighted) normals of the triangles that
+// share that point and face within SMOOTH_ANGLE of it. Faceted transitions (quarter pipes, banks, hips) then read
+// as one continuous curve, while real edges (ledge corners, curbs, stairs: ~90 deg) stay sharp.
+const SMOOTH_COS = Math.cos((42 * Math.PI) / 180);
+function smoothCornerNormals(p) {
+  const nTri = p.length / 9;
+  const fn = new Float32Array(nTri * 3); // area-weighted face normals
+  const groups = new Map();
+  const key = (i) => Math.round(p[i] * 400) + ',' + Math.round(p[i + 1] * 400) + ',' + Math.round(p[i + 2] * 400);
+  for (let t = 0; t < nTri; t++) {
+    const o = t * 9;
+    const ux = p[o + 3] - p[o], uy = p[o + 4] - p[o + 1], uz = p[o + 5] - p[o + 2];
+    const vx = p[o + 6] - p[o], vy = p[o + 7] - p[o + 1], vz = p[o + 8] - p[o + 2];
+    fn[t * 3] = uy * vz - uz * vy;
+    fn[t * 3 + 1] = uz * vx - ux * vz;
+    fn[t * 3 + 2] = ux * vy - uy * vx;
+    for (let k = 0; k < 3; k++) {
+      const kk = key(o + k * 3);
+      let g = groups.get(kk);
+      if (!g) groups.set(kk, (g = []));
+      g.push(t);
+    }
+  }
+  const out = new Float32Array(p.length);
+  for (let t = 0; t < nTri; t++) {
+    const ax = fn[t * 3], ay = fn[t * 3 + 1], az = fn[t * 3 + 2];
+    const al = Math.hypot(ax, ay, az) || 1;
+    for (let k = 0; k < 3; k++) {
+      let sx = ax, sy = ay, sz = az;
+      for (const u of groups.get(key(t * 9 + k * 3))) {
+        if (u === t) continue;
+        const bx = fn[u * 3], by = fn[u * 3 + 1], bz = fn[u * 3 + 2];
+        const bl = Math.hypot(bx, by, bz);
+        if (bl < 1e-12) continue;
+        const c = (ax * bx + ay * by + az * bz) / (al * bl);
+        if (c > SMOOTH_COS) {
+          sx += bx;
+          sy += by;
+          sz += bz;
+        } else if (c < -SMOOTH_COS) {
+          // same surface, opposite winding (double-sided sheets)
+          sx -= bx;
+          sy -= by;
+          sz -= bz;
+        }
+      }
+      const l = Math.hypot(sx, sy, sz) || 1;
+      out[t * 9 + k * 3] = sx / l;
+      out[t * 9 + k * 3 + 1] = sy / l;
+      out[t * 9 + k * 3 + 2] = sz / l;
+    }
+  }
+  return out;
 }
 
 class BVHBody {
   constructor(meshes) {
-    const { geometry, surfaces } = bakeMeshes(meshes);
+    const { geometry, surfaces, smooth } = bakeMeshes(meshes);
     this.geometry = geometry;
     this.surfaces = surfaces;
+    this.smooth = smooth;
     this.bvh = geometry.attributes.position.count ? new MeshBVH(geometry, { targetLeafSize: 8 }) : null;
     geometry.computeBoundingBox();
     this.box = geometry.boundingBox;
@@ -71,6 +129,31 @@ class BVHBody {
     _c.fromBufferAttribute(pos, i2);
     _tri.set(_a, _b, _c);
     return _tri.getNormal(target);
+  }
+
+  // Smoothed normal at a point on a triangle (barycentric blend of its corner normals), same side as the face.
+  smoothNormal(faceIndex, point, faceN, target) {
+    const pos = this.geometry.attributes.position;
+    const idx = this.geometry.index;
+    const i0 = idx ? idx.getX(faceIndex * 3) : faceIndex * 3;
+    const i1 = idx ? idx.getX(faceIndex * 3 + 1) : faceIndex * 3 + 1;
+    const i2 = idx ? idx.getX(faceIndex * 3 + 2) : faceIndex * 3 + 2;
+    _a.fromBufferAttribute(pos, i0);
+    _b.fromBufferAttribute(pos, i1);
+    _c.fromBufferAttribute(pos, i2);
+    _tri.set(_a, _b, _c);
+    if (!_tri.getBarycoord(point, _bc)) return target.copy(faceN);
+    const s = this.smooth;
+    target.set(
+      s[i0 * 3] * _bc.x + s[i1 * 3] * _bc.y + s[i2 * 3] * _bc.z,
+      s[i0 * 3 + 1] * _bc.x + s[i1 * 3 + 1] * _bc.y + s[i2 * 3 + 1] * _bc.z,
+      s[i0 * 3 + 2] * _bc.x + s[i1 * 3 + 2] * _bc.y + s[i2 * 3 + 2] * _bc.z,
+    );
+    const l = target.length();
+    if (l < 1e-6) return target.copy(faceN);
+    target.divideScalar(l);
+    if (target.dot(faceN) < 0) target.negate();
+    return target;
   }
 
   dispose() {
@@ -128,8 +211,10 @@ export class CollisionWorld {
     if (!best) return null;
     const res = out || { point: new THREE.Vector3(), normal: new THREE.Vector3(), distance: 0, surface: 'concrete' };
     res.point.copy(best.point);
-    bestBody.faceNormal(best.faceIndex, res.normal);
-    if (res.normal.dot(dir) > 0) res.normal.negate();
+    // smoothed normal: transitions are continuous curves instead of a stack of flat facets
+    bestBody.faceNormal(best.faceIndex, _fn);
+    if (_fn.dot(dir) > 0) _fn.negate();
+    bestBody.smoothNormal(best.faceIndex, best.point, _fn, res.normal);
     res.distance = best.distance;
     res.surface = bestBody.surfaceOf(best.faceIndex);
     return res;

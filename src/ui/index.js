@@ -23,6 +23,7 @@ export const DEFAULT_SETTINGS = {
   quality: 'high',
   showTrickNames: true,
   gestureGuide: true,
+  flickSide: 'right',
 };
 
 const SCREENS = ['title', 'playing', 'paused', 'customize', 'controls', 'settings', 'dropper'];
@@ -525,6 +526,7 @@ export function createUI({ root, appearance, board, settings, previewHooks, audi
     ['HUD', [
       toggleRow({ label: 'Trick names', get: getS('showTrickNames'), set: setS('showTrickNames'), sound }),
       toggleRow({ label: 'Flick stick guide', get: getS('gestureGuide'), set: setS('gestureGuide'), sound }),
+      segmentRow({ label: 'Flick wheel side', options: [{ id: 'left', name: 'Left' }, { id: 'right', name: 'Right' }], get: getS('flickSide'), set: setS('flickSide'), sound }),
     ]],
   ];
   const allSettingRows = settingsGroups.flatMap(([, rows]) => rows);
@@ -738,6 +740,7 @@ export function createUI({ root, appearance, board, settings, previewHooks, audi
   function applySettings() {
     hudEl.classList.toggle('no-tricks', !cfg.showTrickNames);
     hudEl.classList.toggle('no-stick', !cfg.gestureGuide);
+    hudEl.classList.toggle('stick-right', cfg.flickSide !== 'left');
     refreshStanceNote();
   }
   applySettings();

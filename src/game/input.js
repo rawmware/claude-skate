@@ -24,6 +24,7 @@ export class Input {
     this.lastMouseMove = 0;
     this.mouseSensitivity = 1;
     this.invertFlickY = false;
+    this.flickSide = 'right'; // which gamepad stick draws the flick-it gestures (the other one steers)
     this.mouseEnabled = false; // only while playing (pointer lock or not)
     this.gamepadConnected = false;
     this.lastDevice = 'keyboard';
@@ -85,6 +86,12 @@ export class Input {
     window.addEventListener('gamepaddisconnected', () => {
       this.gamepadConnected = [...(navigator.getGamepads?.() || [])].some(Boolean);
     });
+  }
+
+  // re-zero the mouse flick stick (after a pop): what you draw next, still holding, is board control
+  recenterFlick() {
+    this.mouseStick.x = 0;
+    this.mouseStick.y = 0;
   }
 
   requestPointerLock() {
@@ -202,8 +209,12 @@ export class Input {
     // ---- gamepad ----
     if (pad) {
       const ax = pad.axes;
-      const [lx, ly] = radialDeadzone(ax[0] || 0, ax[1] || 0);
-      const [rx, ry] = radialDeadzone(ax[2] || 0, ax[3] || 0, 0.12);
+      const [plx, ply] = radialDeadzone(ax[0] || 0, ax[1] || 0);
+      const [prx, pry] = radialDeadzone(ax[2] || 0, ax[3] || 0, 0.12);
+      // flick side 'left' swaps the sticks: left stick flicks, right stick steers (menus keep the physical left stick)
+      const swap = this.flickSide === 'left';
+      const [lx, ly] = swap ? [prx, pry] : [plx, ply];
+      const [rx, ry] = swap ? [plx, ply] : [prx, pry];
       const b = pad.buttons.map((bt) => (typeof bt === 'object' ? bt.value > 0.5 || bt.pressed : bt > 0.5));
       const prev = this._prevPadButtons;
       const edge = (i) => b[i] && !prev[i];
@@ -245,10 +256,10 @@ export class Input {
 
       // menu navigation with auto-repeat on stick/dpad
       let dir = null;
-      if (b[12] || ly < -0.6) dir = 'up';
-      else if (b[13] || ly > 0.6) dir = 'down';
-      else if (b[14] || lx < -0.6) dir = 'left';
-      else if (b[15] || lx > 0.6) dir = 'right';
+      if (b[12] || ply < -0.6) dir = 'up';
+      else if (b[13] || ply > 0.6) dir = 'down';
+      else if (b[14] || plx < -0.6) dir = 'left';
+      else if (b[15] || plx > 0.6) dir = 'right';
       const nr = this._navRepeat;
       if (dir) {
         if (nr.dir !== dir) {

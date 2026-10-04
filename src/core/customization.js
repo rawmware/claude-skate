@@ -48,7 +48,7 @@ export const TOPS = [
 ];
 export const TOP_GRAPHICS = [
   { id: 'none', name: 'Blank' },
-  { id: 'logo', name: 'SK8.IO Logo' },
+  { id: 'logo', name: 'Emblem' },
   { id: 'stripe', name: 'Chest Stripe' },
   { id: 'pocket', name: 'Pocket' },
   { id: 'flame', name: 'Flames' },
@@ -76,7 +76,7 @@ export const CLOTH_COLORS = [
 
 export const DECK_GRAPHICS = [
   { id: 'plain', name: 'Blank Stain' },
-  { id: 'logo', name: 'SK8.IO' },
+  { id: 'logo', name: 'Emblem' },
   { id: 'stripes', name: 'Racing Stripes' },
   { id: 'checker', name: 'Checker' },
   { id: 'flames', name: 'Flames' },
@@ -89,7 +89,7 @@ export const DECK_GRAPHICS = [
 export const GRIP_STYLES = [
   { id: 'black', name: 'Black' },
   { id: 'clear', name: 'Clear' },
-  { id: 'cutout', name: 'Cutout Logo' },
+  { id: 'cutout', name: 'Cutout Emblem' },
   { id: 'split', name: 'Split Color' },
 ];
 export const TRUCK_FINISHES = [
